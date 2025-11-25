@@ -1,0 +1,17 @@
+[target.aarch64-linux-android]
+linker = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
+ar = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+
+[build]
+target = "aarch64-linux-android"
+rustflags = ["-l","clang_rt.builtins-aarch64","-L","E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/lib64/clang/14.0.6/lib/baremetal"]
+
+##windows
+#[env]
+#BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/sysroot"
+#CC_aarch64-linux-android = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
+
+##linux
+#[env]
+#CC_aarch64-linux-android = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+#BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
