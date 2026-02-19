@@ -970,11 +970,16 @@ impl Helper for CommandCompleter {}
 /// JS REPL 补全器：通过 socket 向 agent 发送 jscomplete 请求，同步等待结果。
 struct JsReplCompleter {
     sender: Sender<String>,
+    /// Cache the last completion results for the hinter to display
+    last_candidates: std::cell::RefCell<(String, Vec<String>)>,
 }
 
 impl JsReplCompleter {
     fn new(sender: Sender<String>) -> Self {
-        JsReplCompleter { sender }
+        JsReplCompleter {
+            sender,
+            last_candidates: std::cell::RefCell::new((String::new(), vec![])),
+        }
     }
 
     /// Send a jscomplete request and block until the agent replies (≤2000 ms timeout).
@@ -1033,8 +1038,11 @@ impl Completer for JsReplCompleter {
             (0, before_cursor)
         };
 
-        let candidates: Vec<Pair> = self
-            .fetch_completions(query)
+        let names = self.fetch_completions(query);
+        // Cache for hinter
+        *self.last_candidates.borrow_mut() = (before_cursor.to_string(), names.clone());
+
+        let candidates: Vec<Pair> = names
             .into_iter()
             .map(|name| Pair {
                 display: name.clone(),
@@ -1048,15 +1056,57 @@ impl Completer for JsReplCompleter {
 
 impl Hinter for JsReplCompleter {
     type Hint = String;
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        let before_cursor = &line[..pos];
+        let cache = self.last_candidates.borrow();
+        let (ref cached_prefix, ref candidates) = *cache;
+
+        // Only show hint if the current input is a prefix of the cached query
+        // and there are multiple candidates
+        if candidates.len() <= 1 || cached_prefix.is_empty() {
+            return None;
+        }
+
+        // Check if current input matches the cached prefix context
+        if !cached_prefix.starts_with(before_cursor) && !before_cursor.starts_with(cached_prefix.as_str()) {
+            return None;
+        }
+
+        // Get the property fragment after the last dot
+        let prop_part = if let Some(dot_pos) = before_cursor.rfind('.') {
+            &before_cursor[dot_pos + 1..]
+        } else {
+            before_cursor
+        };
+
+        // Filter candidates that match current typing
+        let matching: Vec<&String> = candidates.iter()
+            .filter(|c| c.starts_with(prop_part) && c.as_str() != prop_part)
+            .collect();
+
+        if matching.is_empty() {
+            return None;
+        }
+
+        // Build hint: show as " [debug|error|info|log|warn]"
+        let hint_list = matching.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        Some(format!(" [{}]", hint_list))
+    }
 }
 impl Highlighter for JsReplCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        // Gray text for hint
+        std::borrow::Cow::Owned(format!("\x1b[38;5;245m{}\x1b[0m", hint))
+    }
     fn highlight_candidate<'c>(
         &self,
         candidate: &'c str,
         completion: CompletionType,
     ) -> std::borrow::Cow<'c, str> {
         if completion == CompletionType::List {
-            // Dark gray background + bright white text for list-mode candidates
             std::borrow::Cow::Owned(format!("\x1b[48;5;238m\x1b[38;5;255m{}\x1b[0m", candidate))
         } else {
             std::borrow::Cow::Borrowed(candidate)
@@ -1093,8 +1143,7 @@ fn run_js_repl(sender: &Sender<String>) {
     // Clone the sender so JsReplCompleter can own it
     let sender_clone = sender.clone();
     let config = Config::builder()
-        .completion_type(CompletionType::List)
-        .completion_prompt_limit(usize::MAX)
+        .completion_type(CompletionType::Circular)
         .build();
     let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
         Ok(e) => e,
