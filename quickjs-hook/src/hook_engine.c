@@ -693,6 +693,12 @@ int hook_remove(void* target) {
             }
             hook_flush_cache(target, entry->original_size);
 
+            /* Make pool writable before writing to pool-resident struct fields.
+             * HookEntry nodes live in the exec pool (allocated via hook_alloc).
+             * After installation the pool is R-X, so any write to prev->next or
+             * entry->next without re-enabling PROT_WRITE causes SIGSEGV. */
+            pool_make_writable();
+
             /* Remove from hook list */
             if (prev) {
                 prev->next = entry->next;
@@ -702,6 +708,9 @@ int hook_remove(void* target) {
 
             /* Move to free list for reuse instead of discarding */
             free_entry(entry);
+
+            /* Restore pool to R-X */
+            pool_make_executable();
 
             pthread_mutex_unlock(&g_engine.lock);
             return HOOK_OK;
