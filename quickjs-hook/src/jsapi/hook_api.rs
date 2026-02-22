@@ -3,6 +3,7 @@
 use crate::context::JSContext;
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
+use crate::jsapi::console::output_message;
 use crate::jsapi::ptr::get_native_pointer_addr;
 use crate::value::JSValue;
 use std::collections::HashMap;
@@ -159,6 +160,22 @@ unsafe extern "C" fn hook_callback_wrapper(
 
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
+
+    // Check for JS exception thrown by the callback.
+    // If the callback threw, report the error and skip register write-back.
+    if ffi::qjs_is_exception(result) != 0 {
+        let exc = ffi::JS_GetException(ctx);
+        let exc_val = JSValue(exc);
+        if let Some(msg) = exc_val.to_string(ctx) {
+            output_message(&format!("[hook error] {}", msg));
+        }
+        exc_val.free(ctx);
+        // JS_EXCEPTION sentinel does not own heap memory; qjs_free_value is a no-op for it.
+        ffi::qjs_free_value(ctx, js_ctx);
+        ffi::qjs_free_value(ctx, result);
+        ffi::qjs_free_value(ctx, global);
+        return;
+    }
 
     // Check if callback modified any registers
     // Read back x0-x7 (commonly modified)
@@ -336,9 +353,9 @@ unsafe extern "C" fn js_unhook(
     JSValue::bool(true).raw()
 }
 
-/// callNative(ptr) - Call a native function at the given address with no arguments.
-/// Returns the i64 return value (X0 register) as a BigUint64.
-/// Useful for triggering hooked functions from JS to verify hook callbacks.
+/// callNative(ptr, arg0?, arg1?, ..., arg5?) - Call a native function at addr with 0-6 args.
+/// Arguments are passed in x0-x5 (ARM64 calling convention). Unspecified args default to 0.
+/// Return value: Number when result fits exactly in f64 (≤ 2^53), BigUint64 otherwise.
 unsafe extern "C" fn js_call_native(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -348,7 +365,7 @@ unsafe extern "C" fn js_call_native(
     if argc < 1 {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"callNative() requires 1 argument\0".as_ptr() as *const _,
+            b"callNative() requires at least 1 argument\0".as_ptr() as *const _,
         );
     }
 
@@ -370,7 +387,10 @@ unsafe extern "C" fn js_call_native(
     // Reject null and near-zero addresses without calling mincore:
     // the first 64KB is never a valid user-space function pointer on ARM64 Android.
     if addr < 0x10000 {
-        return ffi::JS_ThrowRangeError(ctx, b"callNative() address is not mapped\0".as_ptr() as *const _);
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"callNative() address is not mapped\0".as_ptr() as *const _,
+        );
     }
 
     // For higher addresses, verify accessibility via mincore before calling.
@@ -381,9 +401,31 @@ unsafe extern "C" fn js_call_native(
         );
     }
 
-    let func: unsafe extern "C" fn() -> i64 = std::mem::transmute(addr as usize);
-    let result = func();
-    ffi::JS_NewBigUint64(ctx, result as u64)
+    // Extract up to 6 integer/pointer arguments (argv[1..6]), passed via x0-x5.
+    // Unspecified arguments default to 0.
+    let mut args = [0u64; 6];
+    for i in 0..6usize {
+        if (i + 1) < argc as usize {
+            let arg = JSValue(*argv.add(i + 1));
+            if let Some(v) = arg.to_u64(ctx) {
+                args[i] = v;
+            }
+            // If conversion fails (e.g. non-numeric arg), keep default 0
+        }
+    }
+
+    let func: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64) -> i64 =
+        std::mem::transmute(addr as usize);
+    let result = func(args[0], args[1], args[2], args[3], args[4], args[5]);
+
+    // Return Number when result fits exactly as f64 (≤ 2^53), BigUint64 for larger values.
+    // This allows JS equality comparisons (==) to work for most practical addresses/values.
+    let result_u64 = result as u64;
+    if result_u64 <= (1u64 << 53) {
+        ffi::qjs_new_float64(ctx, result_u64 as f64)
+    } else {
+        ffi::JS_NewBigUint64(ctx, result_u64)
+    }
 }
 
 /// Register hook API
@@ -401,7 +443,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_unhook), cname.as_ptr(), 1);
         global.set_property(ctx.as_ptr(), "unhook", JSValue(func_val));
 
-        // Register callNative(ptr) - call native function with no args, returns BigUint64
+        // Register callNative(ptr, ...args) - call native function with 0-6 args
         let cname = CString::new("callNative").unwrap();
         let func_val =
             ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_call_native), cname.as_ptr(), 1);

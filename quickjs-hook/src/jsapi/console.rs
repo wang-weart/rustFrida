@@ -28,7 +28,7 @@ pub fn clear_console_callback() {
 }
 
 /// Internal function to output console message
-fn output_message(msg: &str) {
+pub(crate) fn output_message(msg: &str) {
     let guard = CONSOLE_CALLBACK.lock().unwrap();
     if let Some(callback) = guard.as_ref() {
         callback(msg);

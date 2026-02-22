@@ -385,12 +385,15 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
         jump_result = hook_write_jump(target, replacement);
         if (jump_result < 0) {
+            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
             free_entry(entry);
             pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
         entry->stealth = 0;
+        /* Restore target page from RWX to R-X now that the jump is written */
+        mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
     }
 
     /* Flush cache */
@@ -450,6 +453,13 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)entry->target);
     arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_SP, 256); /* pc offset */
 
+    /* Save NZCV condition flags to context.nzcv ([SP+264]).
+     * All instructions above (SUB/STP/STR/ADD/LDR) are non-flag-setting variants,
+     * so NZCV is still intact at this point and reflects the hooked function's entry state.
+     * X17 is safe to use as scratch here — it was already saved to [SP+136] by the STP loop. */
+    arm64_writer_put_mrs_reg(&w, ARM64_REG_X17, 0xDA10); /* MRS X17, NZCV */
+    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264); /* nzcv offset */
+
     /* Call on_enter callback if set */
     if (on_enter) {
         /* Set up arguments: X0 = &HookContext, X1 = user_data */
@@ -502,6 +512,12 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
 
     /* Restore x30 (LR) */
     arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+
+    /* Restore NZCV condition flags from context.nzcv ([SP+264]).
+     * X17 is a caller-saved scratch register per ABI; using it here to ferry
+     * the NZCV value to MSR does not violate any calling convention. */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264); /* nzcv offset */
+    arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X17); /* MSR NZCV, X17 */
 
     /* Deallocate stack */
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
@@ -634,12 +650,15 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         }
         jump_result = hook_write_jump(target, thunk_mem);
         if (jump_result < 0) {
+            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
             free_entry(entry);
             pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
         entry->stealth = 0;
+        /* Restore target page from RWX to R-X now that the jump is written */
+        mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
     }
 
     /* Flush caches */
@@ -690,6 +709,8 @@ int hook_remove(void* target) {
                     return HOOK_ERROR_MPROTECT_FAILED;
                 }
                 memcpy(target, entry->original_bytes, entry->original_size);
+                /* Restore target page from RWX to R-X after writing original bytes back */
+                mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
             }
             hook_flush_cache(target, entry->original_size);
 
@@ -741,7 +762,7 @@ void hook_engine_cleanup(void) {
     /* Make pool writable for cleanup state reset */
     pool_make_writable();
 
-    /* Restore all hooks */
+    /* Restore all hooked target functions to their original bytes. */
     HookEntry* entry = g_engine.hooks;
     while (entry) {
         if (entry->stealth) {
@@ -750,12 +771,25 @@ void hook_engine_cleanup(void) {
             uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
             mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy(entry->target, entry->original_bytes, entry->original_size);
+            /* Restore target page to R-X after writing original bytes back */
+            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
         }
         hook_flush_cache(entry->target, entry->original_size);
         entry = entry->next;
     }
 
-    /* Reset state */
+    /* HookEntry lifetime note:
+     * All HookEntry structs (including trampoline and thunk memory) live inside
+     * g_engine.exec_mem (the executable pool). The pool is a single mmap'd region
+     * that is released via munmap by the caller after hook_engine_cleanup() returns.
+     * Therefore we do NOT iterate the list to free individual entries here — the
+     * munmap in the caller frees the entire pool at once.
+     *
+     * WARNING: Do NOT add malloc()/free() fallback paths for alloc_entry(). If pool
+     * allocations ever fall back to malloc, those pointers would be invalid after a
+     * munmap and would require explicit free() here. Keep all hook memory in the pool. */
+
+    /* Reset state — the list pointers are now dangling (pool about to be unmapped) */
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
     g_engine.exec_mem_used = 0;
