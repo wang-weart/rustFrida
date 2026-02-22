@@ -15,6 +15,19 @@ thread_local! {
 /// NativePointer class name
 const NATIVE_POINTER_CLASS_NAME: &[u8] = b"NativePointer\0";
 
+/// Finalizer called by QuickJS GC when a NativePointer object is collected.
+/// Frees the 8-byte heap allocation created by Box::into_raw in create_native_pointer.
+unsafe extern "C" fn native_pointer_finalizer(_rt: *mut ffi::JSRuntime, val: ffi::JSValue) {
+    let class_id = NATIVE_POINTER_CLASS_ID.with(|id| id.get());
+    if class_id == 0 {
+        return;
+    }
+    let opaque = ffi::JS_GetOpaque(val, class_id);
+    if !opaque.is_null() {
+        drop(Box::from_raw(opaque as *mut u64));
+    }
+}
+
 /// Initialize NativePointer class and get the class ID.
 ///
 /// The class ID is allocated once per thread (thread_local) and reused across
@@ -41,7 +54,7 @@ fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
             // If already registered on this runtime, JS_NewClass1 returns -1 (no-op).
             let class_def = ffi::JSClassDef {
                 class_name: NATIVE_POINTER_CLASS_NAME.as_ptr() as *const _,
-                finalizer: None,
+                finalizer: Some(native_pointer_finalizer),
                 gc_mark: None,
                 call: None,
                 exotic: std::ptr::null_mut(),

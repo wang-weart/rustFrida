@@ -5,6 +5,28 @@ use crate::ffi;
 use crate::jsapi::ptr::{create_native_pointer, get_native_pointer_addr};
 use crate::value::JSValue;
 use std::ffi::CString;
+use libc;
+
+/// Check if [addr, addr+size) is readable using mincore(2).
+/// Returns false for null/zero or unmapped pages.
+fn is_addr_accessible(addr: u64, size: usize) -> bool {
+    if addr == 0 || size == 0 {
+        return false;
+    }
+    unsafe {
+        const PAGE_SIZE: usize = 0x1000;
+        let page_addr = (addr as usize) & !(PAGE_SIZE - 1);
+        let end = (addr as usize).wrapping_add(size);
+        let region_len = end.saturating_sub(page_addr);
+        let pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
+        let mut vec = vec![0u8; pages];
+        libc::mincore(
+            page_addr as *mut libc::c_void,
+            region_len,
+            vec.as_mut_ptr() as *mut _,
+        ) == 0
+    }
+}
 
 /// Helper to get address from argument
 unsafe fn get_addr_from_arg(ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
@@ -27,6 +49,9 @@ unsafe extern "C" fn memory_read_u8(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 1) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = *(addr as *const u8);
     JSValue::int(val as i32).raw()
 }
@@ -50,6 +75,9 @@ unsafe extern "C" fn memory_read_u16(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 2) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = *(addr as *const u16);
     JSValue::int(val as i32).raw()
 }
@@ -73,6 +101,9 @@ unsafe extern "C" fn memory_read_u32(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 4) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = *(addr as *const u32);
     // Use BigInt for values that might overflow i32
     ffi::JS_NewBigUint64(ctx, val as u64)
@@ -97,6 +128,9 @@ unsafe extern "C" fn memory_read_u64(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 8) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = *(addr as *const u64);
     ffi::JS_NewBigUint64(ctx, val)
 }
@@ -120,6 +154,9 @@ unsafe extern "C" fn memory_read_pointer(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 8) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = *(addr as *const u64);
     create_native_pointer(ctx, val).raw()
 }
@@ -143,6 +180,9 @@ unsafe extern "C" fn memory_read_cstring(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 1) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let cstr = std::ffi::CStr::from_ptr(addr as *const _);
     let s = cstr.to_string_lossy();
     JSValue::string(ctx, &s).raw()
@@ -180,6 +220,9 @@ unsafe extern "C" fn memory_read_byte_array(
 
     let length = JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(0) as usize;
 
+    if !is_addr_accessible(addr, length.max(1)) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     // Create ArrayBuffer
     let slice = std::slice::from_raw_parts(addr as *const u8, length);
     let arr = ffi::JS_NewArrayBufferCopy(ctx, slice.as_ptr(), length);
@@ -205,6 +248,9 @@ unsafe extern "C" fn memory_write_u8(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 1) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(0) as u8;
     *(addr as *mut u8) = val;
     JSValue::undefined().raw()
@@ -229,6 +275,9 @@ unsafe extern "C" fn memory_write_u16(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 2) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(0) as u16;
     *(addr as *mut u16) = val;
     JSValue::undefined().raw()
@@ -253,6 +302,9 @@ unsafe extern "C" fn memory_write_u32(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 4) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(0) as u32;
     *(addr as *mut u32) = val;
     JSValue::undefined().raw()
@@ -277,6 +329,9 @@ unsafe extern "C" fn memory_write_u64(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
+    if !is_addr_accessible(addr, 8) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
     let val = JSValue(*argv.add(1)).to_u64(ctx).unwrap_or(0);
     *(addr as *mut u64) = val;
     JSValue::undefined().raw()

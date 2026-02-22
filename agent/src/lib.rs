@@ -129,11 +129,10 @@ impl ExecMem {
             return Err(String::from("剩余exe_mem耗尽"));
         }
         unsafe {
-            let dest = self.ptr.add(self.used);
-            ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-            // let old_used = self.used;
+            let start = self.ptr.add(self.used);
+            ptr::copy_nonoverlapping(data.as_ptr(), start, data.len());
             self.used += data.len();
-            Ok(self.ptr.add(self.used))
+            Ok(start)
         }
     }
 

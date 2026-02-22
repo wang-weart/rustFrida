@@ -7,6 +7,7 @@ use libc::{
     c_int, c_void, iovec, mmap, pid_t, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE,
     PROT_READ, PROT_WRITE, PTRACE_ATTACH, PTRACE_DETACH,
 };
+use std::sync::atomic::{AtomicPtr, Ordering};
 use nix::errno::Errno;
 use once_cell::unsync::Lazy;
 use std::io::Write;
@@ -70,7 +71,7 @@ pub struct BranchRegUsage {
 
 // ============== 静态变量 ==============
 
-static mut INSTRUCT_PTR: *const u32 = null_mut();
+static INSTRUCT_PTR: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
 static mut EXE_MEM: Lazy<Mutex<ExecMem>> = Lazy::new(|| Mutex::new(ExecMem::new().unwrap()));
 
 // ============== ptrace 操作 ==============
@@ -432,14 +433,12 @@ pub fn gen_mov_reg_addr(reg: u8, imm: usize) -> Vec<u32> {
     for i in 0..4 {
         let imm16 = ((imm >> (i * 16)) & 0xFFFF) as u16;
         if i == 0 {
-            // MOVZ
-            if imm16 != 0 {
-                let instr =
-                    0xD2800000 | ((imm16 as u32) << 5) | ((reg as u32) & 0x1F) | ((i as u32) << 21);
-                code.push(instr);
-            }
+            // MOVZ always generated for first chunk (handles zero case)
+            let instr =
+                0xD2800000 | ((imm16 as u32) << 5) | ((reg as u32) & 0x1F) | ((i as u32) << 21);
+            code.push(instr);
         } else {
-            // MOVK
+            // MOVK only when non-zero
             if imm16 != 0 {
                 let instr =
                     0xF2800000 | ((imm16 as u32) << 5) | ((reg as u32) & 0x1F) | ((i as u32) << 21);
@@ -494,7 +493,7 @@ pub extern "C" fn transformer_wrapper_full(ctx: [usize; 32]) -> usize {
             log.push_str(&format!("regs[{}] = {:x}\n", i, ctx[31 - i]));
         }
         vall.pstate = ctx[0];
-        let addr = resolve_next_addr(INSTRUCT_PTR, vall).unwrap();
+        let addr = resolve_next_addr(INSTRUCT_PTR.load(Ordering::Acquire), vall).unwrap();
 
         match transformer_global(addr) {
             Ok(addr) => addr,
@@ -510,20 +509,22 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
         let mut exe_mem = EXE_MEM.lock().unwrap();
         let ret_addr = exe_mem.current_addr();
 
-        if is_arm64_call(*INSTRUCT_PTR) {
-            for instr in gen_mov_reg_addr(30, INSTRUCT_PTR.add(1) as usize) {
+        let iptr = INSTRUCT_PTR.load(Ordering::Acquire);
+        if is_arm64_call(*iptr) {
+            for instr in gen_mov_reg_addr(30, iptr.add(1) as usize) {
                 exe_mem.write_u32(instr)?;
             }
         }
 
-        INSTRUCT_PTR = addr as *const u32;
+        INSTRUCT_PTR.store(addr as *mut u32, Ordering::Release);
         let closure_result = {
-            while !is_arm64_branch(*INSTRUCT_PTR) {
+            while !is_arm64_branch(*INSTRUCT_PTR.load(Ordering::Acquire)) {
+                let cur = INSTRUCT_PTR.load(Ordering::Acquire);
                 relocater::relocate_one_a64(
-                    INSTRUCT_PTR as usize,
+                    cur as usize,
                     exe_mem.external_write_instruct(),
                 );
-                INSTRUCT_PTR = INSTRUCT_PTR.add(1);
+                INSTRUCT_PTR.store(cur.add(1), Ordering::Release);
             }
             Ok(())
         };
@@ -602,14 +603,17 @@ extern "C" fn tracer(thread_id: i32) -> c_int {
         let mut exe_mem = EXE_MEM.lock().unwrap();
 
         let mut regs = get_registers(thread_id).unwrap();
-        INSTRUCT_PTR = regs.pc as *const u32;
+        INSTRUCT_PTR.store(regs.pc as *mut u32, Ordering::Release);
         let _ = stream.write_all(
-            ("\nget pc: ".to_string() + &(INSTRUCT_PTR as usize).to_string()).as_bytes(),
+            ("\nget pc: ".to_string()
+                + &(INSTRUCT_PTR.load(Ordering::Acquire) as usize).to_string())
+                .as_bytes(),
         );
 
-        while !is_arm64_branch(*INSTRUCT_PTR) {
-            relocater::relocate_one_a64(INSTRUCT_PTR as usize, exe_mem.external_write_instruct());
-            INSTRUCT_PTR = INSTRUCT_PTR.add(1);
+        while !is_arm64_branch(*INSTRUCT_PTR.load(Ordering::Acquire)) {
+            let cur = INSTRUCT_PTR.load(Ordering::Acquire);
+            relocater::relocate_one_a64(cur as usize, exe_mem.external_write_instruct());
+            INSTRUCT_PTR.store(cur.add(1), Ordering::Release);
         }
 
         for instruct in gen_jump_to_transformer() {

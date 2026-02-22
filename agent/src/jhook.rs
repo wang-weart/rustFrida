@@ -134,11 +134,10 @@ pub fn jhook() -> Result<String, String> {
             CString::new("ro.build.version.sdk").unwrap().as_ptr(),
             buf_ptr,
         );
-        let lapilevel = *apilevel.get_or_init(|| unsafe {
-            CString::from_raw(buf_ptr)
+        let lapilevel = *apilevel.get_or_init(|| {
+            unsafe { CStr::from_ptr(buf_ptr) }
                 .to_str()
                 .unwrap()
-                .to_owned()
                 .parse()
                 .unwrap()
         });
@@ -147,13 +146,11 @@ pub fn jhook() -> Result<String, String> {
             CString::new("ro.build.version.codename").unwrap().as_ptr(),
             buf_ptr,
         );
-        let lcodename = codename.get_or_init(|| unsafe {
-            CString::from_raw(buf_ptr)
+        let lcodename = codename.get_or_init(|| {
+            unsafe { CStr::from_ptr(buf_ptr) }
                 .to_str()
                 .unwrap()
                 .to_owned()
-                .parse()
-                .unwrap()
         });
 
         let mut jvm_ptr: sys::JavaVM = ptr::null_mut();
