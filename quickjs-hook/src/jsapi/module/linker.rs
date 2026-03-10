@@ -9,24 +9,12 @@ fn find_linker_info() -> (u64, String) {
         None => return (0, String::new()),
     };
 
-    for line in maps.lines() {
-        if !line.contains("linker64") || line.contains(".so") {
+    for entry in crate::jsapi::util::proc_maps_entries(&maps) {
+        let Some(path) = entry.path else {
             continue;
-        }
-        let addr_part = match line.split_whitespace().next() {
-            Some(a) => a,
-            None => continue,
         };
-        let path = match line.split_whitespace().last() {
-            Some(p) if p.contains("linker64") => p.to_string(),
-            _ => continue,
-        };
-        let start = addr_part
-            .split('-')
-            .next()
-            .and_then(|s| u64::from_str_radix(s, 16).ok());
-        if let Some(s) = start {
-            return (s, path);
+        if path.contains("linker64") && !path.contains(".so") {
+            return (entry.start, path.to_string());
         }
     }
     (0, String::new())

@@ -2,6 +2,7 @@
 
 use crate::ffi;
 use crate::jsapi::ptr::get_native_pointer_addr;
+use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
 use crate::value::JSValue;
 
 /// Helper to get address from argument
@@ -12,54 +13,11 @@ pub(super) unsafe fn get_addr_from_arg(ctx: *mut ffi::JSContext, val: JSValue) -
 /// Parse page permissions for `addr` from /proc/self/maps.
 /// Returns the libc PROT_* flags for the page, or `None` if not found.
 fn get_page_prot(addr: u64) -> Option<i32> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let file = File::open("/proc/self/maps").ok()?;
-    for line in BufReader::new(file).lines().flatten() {
-        // Format: "start-end perms offset dev inode pathname"
-        let b = line.as_bytes();
-        if let Some(dash) = b.iter().position(|&x| x == b'-') {
-            let Ok(start) = u64::from_str_radix(&line[..dash], 16) else {
-                continue;
-            };
-            let rest = &line[dash + 1..];
-            if let Some(sp) = rest.bytes().position(|x| x == b' ') {
-                let Ok(end) = u64::from_str_radix(&rest[..sp], 16) else {
-                    continue;
-                };
-                if addr >= start && addr < end {
-                    let perms = rest[sp + 1..].as_bytes();
-                    if perms.len() < 3 {
-                        return None;
-                    }
-                    let mut prot = 0i32;
-                    if perms[0] == b'r' {
-                        prot |= libc::PROT_READ;
-                    }
-                    if perms[1] == b'w' {
-                        prot |= libc::PROT_WRITE;
-                    }
-                    if perms[2] == b'x' {
-                        prot |= libc::PROT_EXEC;
-                    }
-                    return Some(prot);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Check whether the page containing `addr` is writable by parsing /proc/self/maps.
-/// Returns `true` if writable (or if the map cannot be read — assume writable to avoid
-/// breaking writes to legitimate RW pages).
-#[allow(dead_code)]
-pub(super) fn is_page_writable(addr: u64) -> bool {
-    match get_page_prot(addr) {
-        Some(prot) => (prot & libc::PROT_WRITE) != 0,
-        None => true, // can't determine; assume writable
-    }
+    let maps = read_proc_self_maps()?;
+    let prot = proc_maps_entries(&maps)
+        .find(|entry| entry.contains(addr))
+        .map(|entry| entry.prot_flags());
+    prot
 }
 
 /// Perform `write_fn` at `addr`, temporarily making the containing page(s) writable

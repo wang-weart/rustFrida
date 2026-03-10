@@ -67,41 +67,11 @@ fn parse_proc_maps() -> Vec<MemRegion> {
         None => return Vec::new(),
     };
 
-    let mut regions = Vec::new();
-    for line in content.lines() {
-        // 格式: 7f1234000-7f1235000 r-xp 00000000 ...
-        let mut parts = line.splitn(3, ' ');
-        let range = match parts.next() {
-            Some(r) => r,
-            None => continue,
-        };
-        let perms = match parts.next() {
-            Some(p) => p,
-            None => continue,
-        };
-
-        // 只保留有 'r' 权限的区间
-        if !perms.starts_with('r') {
-            continue;
-        }
-
-        let mut range_parts = range.splitn(2, '-');
-        let start_str = match range_parts.next() {
-            Some(s) => s,
-            None => continue,
-        };
-        let end_str = match range_parts.next() {
-            Some(s) => s,
-            None => continue,
-        };
-
-        if let (Ok(start), Ok(end)) = (
-            u64::from_str_radix(start_str, 16),
-            u64::from_str_radix(end_str, 16),
-        ) {
-            regions.push(MemRegion { start, end });
-        }
-    }
-
-    regions
+    crate::jsapi::util::proc_maps_entries(&content)
+        .filter(|entry| entry.prot_flags() & libc::PROT_READ != 0)
+        .map(|entry| MemRegion {
+            start: entry.start,
+            end: entry.end,
+        })
+        .collect()
 }

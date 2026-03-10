@@ -275,26 +275,8 @@ fn find_module_base_for_path(path: &str) -> u64 {
         Some(s) => s,
         None => return 0,
     };
-    for line in maps.lines() {
-        if !line.contains(path) {
-            continue;
-        }
-        let file_path = match line.split_whitespace().last() {
-            Some(p) if p == path => p,
-            _ => continue,
-        };
-        let _ = file_path; // used for exact match above
-        let addr_part = match line.split_whitespace().next() {
-            Some(a) => a,
-            None => continue,
-        };
-        if let Some(start) = addr_part
-            .split('-')
-            .next()
-            .and_then(|s| u64::from_str_radix(s, 16).ok())
-        {
-            return start;
-        }
-    }
-    0
+    let base = crate::jsapi::util::proc_maps_entries(&maps)
+        .find_map(|entry| (entry.path == Some(path)).then_some(entry.start))
+        .unwrap_or(0);
+    base
 }

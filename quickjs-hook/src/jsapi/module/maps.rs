@@ -8,51 +8,19 @@ pub(crate) fn probe_libart_range() -> (u64, u64) {
         Some(s) => s,
         None => return (0, 0),
     };
-
-    let mut range_start: u64 = u64::MAX;
-    let mut range_end: u64 = 0;
-    let mut found_path: Option<String> = None;
-
-    for line in maps.lines() {
-        if !line.contains("libart.so") {
-            continue;
-        }
-        let addr_part = match line.split_whitespace().next() {
-            Some(a) => a,
-            None => continue,
-        };
-        let mut parts = addr_part.split('-');
-        let start = parts.next().and_then(|s| u64::from_str_radix(s, 16).ok());
-        let end = parts.next().and_then(|s| u64::from_str_radix(s, 16).ok());
-
-        if let (Some(s), Some(e)) = (start, end) {
-            if s < range_start {
-                range_start = s;
-            }
-            if e > range_end {
-                range_end = e;
-            }
-        }
-
-        if found_path.is_none() {
-            if let Some(path) = line.split_whitespace().last() {
-                if path.contains("libart.so") {
-                    found_path = Some(path.to_string());
-                }
-            }
-        }
-    }
+    let summary = summarize_matching_paths(&maps, |path| path.contains("libart.so"));
+    let found_path = summary.as_ref().map(|summary| summary.first_path.clone());
 
     let _ = LIBART_PATH.set(found_path.clone());
 
-    if range_start == u64::MAX {
-        (0, 0)
-    } else {
+    if let Some(summary) = summary {
         output_message(&format!(
             "[module] libart.so range: {:#x}-{:#x}, path: {:?}",
-            range_start, range_end, found_path
+            summary.base, summary.end, found_path
         ));
-        (range_start, range_end)
+        (summary.base, summary.end)
+    } else {
+        (0, 0)
     }
 }
 
@@ -64,46 +32,9 @@ pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
         None => return (0, 0),
     };
 
-    let mut range_start: u64 = u64::MAX;
-    let mut range_end: u64 = 0;
-
-    for line in maps.lines() {
-        if !line.contains(module_name) {
-            continue;
-        }
-        // Verify the path field actually contains the module name
-        let path = match line.split_whitespace().last() {
-            Some(p) if p.contains(module_name) => p,
-            _ => continue,
-        };
-        let basename = path.rsplit('/').next().unwrap_or(path);
-        if basename != module_name {
-            continue;
-        }
-
-        let addr_part = match line.split_whitespace().next() {
-            Some(a) => a,
-            None => continue,
-        };
-        let mut parts = addr_part.split('-');
-        let start = parts.next().and_then(|s| u64::from_str_radix(s, 16).ok());
-        let end = parts.next().and_then(|s| u64::from_str_radix(s, 16).ok());
-
-        if let (Some(s), Some(e)) = (start, end) {
-            if s < range_start {
-                range_start = s;
-            }
-            if e > range_end {
-                range_end = e;
-            }
-        }
-    }
-
-    if range_start == u64::MAX {
-        (0, 0)
-    } else {
-        (range_start, range_end)
-    }
+    summarize_matching_paths(&maps, |path| matches_exact_module_name(path, module_name))
+        .map(|summary| (summary.base, summary.end))
+        .unwrap_or((0, 0))
 }
 
 /// Parse /proc/self/maps to find a module's base address.
@@ -113,40 +44,12 @@ fn find_module_base(module_name: &str) -> u64 {
         None => return 0,
     };
 
-    for line in maps.lines() {
-        if !line.contains(module_name) {
-            continue;
-        }
-        // Only match lines where the path field actually contains the module name
-        let path = match line.split_whitespace().last() {
-            Some(p) if p.contains(module_name) => p,
-            _ => continue,
-        };
-        // Verify exact filename match (avoid "libfoo.so" matching "libfoo.so.1")
-        let basename = path.rsplit('/').next().unwrap_or(path);
-        if basename != module_name && !basename.starts_with(&format!("{}.", module_name)) {
-            // Also check if module_name is a path suffix
-            if !path.ends_with(module_name) {
-                continue;
-            }
-        }
-
-        let addr_part = match line.split_whitespace().next() {
-            Some(a) => a,
-            None => continue,
-        };
-        if let Some(start) = addr_part
-            .split('-')
-            .next()
-            .and_then(|s| u64::from_str_radix(s, 16).ok())
-        {
-            return start;
-        }
-    }
-    0
+    find_first_matching_path_start(&maps, |path| matches_module_lookup_name(path, module_name))
+        .unwrap_or(0)
 }
 
 /// Module info from /proc/self/maps
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ModuleInfo {
     name: String,
     base: u64,
@@ -154,66 +57,223 @@ struct ModuleInfo {
     path: String,
 }
 
-/// Parse /proc/self/maps and aggregate VMAs per unique path.
-fn enumerate_modules_from_maps() -> Vec<ModuleInfo> {
+impl ModuleInfo {
+    fn from_path_range(path: String, base: u64, end: u64) -> Self {
+        let name = module_basename(&path).to_string();
+        Self {
+            name,
+            base,
+            size: end - base,
+            path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModuleMapEntry {
+    start: u64,
+    end: u64,
+    path: String,
+}
+
+impl ModuleMapEntry {
+    fn from_proc_map_entry(entry: crate::jsapi::util::ProcMapEntry<'_>) -> Option<Self> {
+        let path = entry.path?;
+        if path.starts_with('[') || !path.contains('/') {
+            return None;
+        }
+
+        Some(Self {
+            start: entry.start,
+            end: entry.end,
+            path: path.to_string(),
+        })
+    }
+
+    fn contains(&self, addr: u64) -> bool {
+        addr >= self.start && addr < self.end
+    }
+
+    fn path_score(&self) -> u8 {
+        if self.path.starts_with("/dev/") {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+struct AggregatedModuleRange {
+    path: String,
+    base: u64,
+    end: u64,
+}
+
+impl AggregatedModuleRange {
+    fn from_entry(entry: &ModuleMapEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            base: entry.start,
+            end: entry.end,
+        }
+    }
+
+    fn include(&mut self, entry: &ModuleMapEntry) {
+        if entry.start < self.base {
+            self.base = entry.start;
+        }
+        if entry.end > self.end {
+            self.end = entry.end;
+        }
+    }
+
+    fn into_module_info(self) -> ModuleInfo {
+        ModuleInfo::from_path_range(self.path, self.base, self.end)
+    }
+}
+
+/// Parse file-backed VMAs from /proc/self/maps without merging gaps.
+fn parse_module_map_entries(maps: &str) -> Vec<ModuleMapEntry> {
+    crate::jsapi::util::proc_maps_entries(maps)
+        .filter_map(ModuleMapEntry::from_proc_map_entry)
+        .collect()
+}
+
+fn enumerate_module_map_entries() -> Vec<ModuleMapEntry> {
     let maps = match super::util::read_proc_self_maps() {
         Some(s) => s,
         None => return Vec::new(),
     };
 
-    // Collect (path -> (min_start, max_end)) using insertion-order Vec
-    let mut modules: Vec<(String, u64, u64)> = Vec::new();
+    parse_module_map_entries(&maps)
+}
 
-    for line in maps.lines() {
-        let mut fields = line.split_whitespace();
-        let addr_part = match fields.next() {
-            Some(a) => a,
-            None => continue,
-        };
-        // Skip non-file mappings (no path field, or path starts with '[')
-        // fields: perms, offset, dev, inode, path
-        let _perms = fields.next();
-        let _offset = fields.next();
-        let _dev = fields.next();
-        let _inode = fields.next();
-        let path = match fields.next() {
-            Some(p) if !p.starts_with('[') && p.contains('/') => p,
-            _ => continue,
-        };
+fn aggregate_modules(entries: impl IntoIterator<Item = ModuleMapEntry>) -> Vec<ModuleInfo> {
+    let entries: Vec<_> = entries.into_iter().collect();
+    collect_module_ranges(entries.iter())
+        .into_iter()
+        .map(AggregatedModuleRange::into_module_info)
+        .collect()
+}
 
-        let mut parts = addr_part.split('-');
-        let start = match parts.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
-            Some(s) => s,
-            None => continue,
-        };
-        let end = match parts.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
-            Some(e) => e,
-            None => continue,
-        };
+fn aggregate_module_for_path(entries: &[ModuleMapEntry], path: &str) -> Option<ModuleInfo> {
+    collect_module_ranges(entries.iter())
+        .into_iter()
+        .find(|module| module.path == path)
+        .map(AggregatedModuleRange::into_module_info)
+}
 
-        // Find or insert
-        if let Some(entry) = modules.iter_mut().find(|(p, _, _)| p == path) {
-            if start < entry.1 {
-                entry.1 = start;
-            }
-            if end > entry.2 {
-                entry.2 = end;
-            }
+/// Parse /proc/self/maps and aggregate VMAs per unique path.
+fn enumerate_modules_from_maps() -> Vec<ModuleInfo> {
+    aggregate_modules(enumerate_module_map_entries())
+}
+
+fn find_module_by_address_in_entries(
+    entries: impl IntoIterator<Item = ModuleMapEntry>,
+    addr: u64,
+) -> Option<ModuleInfo> {
+    let entries: Vec<_> = entries.into_iter().collect();
+    let path = entries
+        .iter()
+        .filter(|entry| entry.contains(addr))
+        .min_by(|a, b| {
+            a.path_score()
+                .cmp(&b.path_score())
+                .then_with(|| (a.end - a.start).cmp(&(b.end - b.start)))
+                .then_with(|| b.start.cmp(&a.start))
+        })
+        .map(|entry| entry.path.clone())?;
+
+    aggregate_module_for_path(&entries, &path)
+}
+
+/// Find the module containing `addr` and return the module-wide aggregated range.
+fn find_module_by_address(addr: u64) -> Option<ModuleInfo> {
+    find_module_by_address_in_entries(enumerate_module_map_entries(), addr)
+}
+
+fn collect_module_ranges<'a>(
+    entries: impl IntoIterator<Item = &'a ModuleMapEntry>,
+) -> Vec<AggregatedModuleRange> {
+    let mut modules: Vec<AggregatedModuleRange> = Vec::new();
+
+    for entry in entries {
+        if let Some(module) = modules.iter_mut().find(|module| module.path == entry.path) {
+            module.include(entry);
         } else {
-            modules.push((path.to_string(), start, end));
+            modules.push(AggregatedModuleRange::from_entry(entry));
         }
     }
 
     modules
-        .into_iter()
-        .map(|(path, base, end)| {
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            ModuleInfo {
-                name,
-                base,
-                size: end - base,
-                path,
-            }
-        })
-        .collect()
 }
+
+fn module_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn matches_exact_module_name(path: &str, module_name: &str) -> bool {
+    path.contains(module_name) && module_basename(path) == module_name
+}
+
+fn matches_module_lookup_name(path: &str, module_name: &str) -> bool {
+    if !path.contains(module_name) {
+        return false;
+    }
+
+    let basename = module_basename(path);
+    basename == module_name
+        || basename.starts_with(&format!("{}.", module_name))
+        || path.ends_with(module_name)
+}
+
+struct PathMapSummary {
+    base: u64,
+    end: u64,
+    first_path: String,
+}
+
+fn summarize_matching_paths(
+    maps: &str,
+    mut matches_path: impl FnMut(&str) -> bool,
+) -> Option<PathMapSummary> {
+    let mut base = u64::MAX;
+    let mut end = 0;
+    let mut first_path = None;
+
+    for entry in crate::jsapi::util::proc_maps_entries(maps) {
+        let Some(path) = entry.path else {
+            continue;
+        };
+        if !matches_path(path) {
+            continue;
+        }
+
+        if entry.start < base {
+            base = entry.start;
+        }
+        if entry.end > end {
+            end = entry.end;
+        }
+        if first_path.is_none() {
+            first_path = Some(path.to_string());
+        }
+    }
+
+    first_path.map(|first_path| PathMapSummary {
+        base,
+        end,
+        first_path,
+    })
+}
+
+fn find_first_matching_path_start(
+    maps: &str,
+    mut matches_path: impl FnMut(&str) -> bool,
+) -> Option<u64> {
+    crate::jsapi::util::proc_maps_entries(maps).find_map(|entry| {
+        let path = entry.path?;
+        matches_path(path).then_some(entry.start)
+    })
+}
+
