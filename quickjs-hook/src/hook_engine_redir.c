@@ -8,6 +8,102 @@
 
 #include "hook_engine_internal.h"
 
+#define NATIVE_FAKE_CODEINFO_BYTES 12
+#define NATIVE_FAKE_OAT_PREFIX_SIZE (NATIVE_FAKE_CODEINFO_BYTES + 4)
+#define NATIVE_HOOK_CONTEXT_FRAME_SIZE 352
+#define NATIVE_STACK_METHOD_SLOT_SIZE 16
+#define NATIVE_TOTAL_FRAME_SIZE (NATIVE_STACK_METHOD_SLOT_SIZE + NATIVE_HOOK_CONTEXT_FRAME_SIZE)
+#define NATIVE_FAKE_PACKED_FRAME_SIZE (NATIVE_HOOK_CONTEXT_FRAME_SIZE / 16)
+
+static void encode_native_fake_codeinfo(uint8_t buf[NATIVE_FAKE_CODEINFO_BYTES],
+                                        uint32_t code_size, uint32_t frame_packed) {
+    memset(buf, 0, NATIVE_FAKE_CODEINFO_BYTES);
+    buf[0] = 0xF0;
+    buf[1] = 0x0F;
+    buf[2] = 0x00;
+    buf[3] = (uint8_t)((code_size & 0x0F) << 4);
+    buf[4] = (uint8_t)((code_size >> 4)  & 0xFF);
+    buf[5] = (uint8_t)((code_size >> 12) & 0xFF);
+    buf[6] = (uint8_t)((code_size >> 20) & 0xFF);
+    buf[7] = (uint8_t)(((code_size >> 28) & 0x0F) | ((frame_packed & 0x0F) << 4));
+    buf[8] = (uint8_t)((frame_packed >> 4)  & 0xFF);
+    buf[9] = (uint8_t)((frame_packed >> 12) & 0xFF);
+    buf[10]= (uint8_t)((frame_packed >> 20) & 0xFF);
+    buf[11]= (uint8_t)((frame_packed >> 28) & 0x0F);
+}
+
+static void backfill_native_fake_oat_header(void* thunk_mem, uint32_t body_size) {
+    uint8_t* p = (uint8_t*)thunk_mem;
+    encode_native_fake_codeinfo(p, body_size, NATIVE_FAKE_PACKED_FRAME_SIZE);
+    uint32_t code_info_offset = NATIVE_FAKE_OAT_PREFIX_SIZE;
+    memcpy(p + NATIVE_FAKE_CODEINFO_BYTES, &code_info_offset, sizeof(uint32_t));
+}
+
+static void emit_save_native_hook_context(Arm64Writer* w, uint64_t target_pc) {
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, NATIVE_TOTAL_FRAME_SIZE);
+
+    /* HookContext lives at SP+16. SP+0 is reserved for StackVisitor's ArtMethod*. */
+    for (int i = 0; i < 30; i += 2) {
+        arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
+                                                 ARM64_REG_SP, NATIVE_STACK_METHOD_SLOT_SIZE + i * 8,
+                                                 ARM64_INDEX_SIGNED_OFFSET);
+    }
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X30, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 240);
+
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_SP, NATIVE_TOTAL_FRAME_SIZE);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 248);
+
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, target_pc);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 256);
+
+    arm64_writer_put_mrs_reg(w, ARM64_REG_X17, 0xDA10);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 264);
+
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP,
+                                       NATIVE_STACK_METHOD_SLOT_SIZE + 280 + i * 8);
+    }
+
+    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X16, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 344);
+}
+
+static void emit_store_replacement_for_stackvisitor(Arm64Writer* w, uint64_t original_method) {
+    uint64_t lbl_loop = arm64_writer_new_label_id(w);
+    uint64_t lbl_found = arm64_writer_new_label_id(w);
+    uint64_t lbl_done = arm64_writer_new_label_id(w);
+
+    /* Default to 0; normal path below overwrites with replacement ArtMethod*. */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_SP, 0);
+
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)g_art_router_table);
+    arm64_writer_put_label(w, lbl_loop);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X17, lbl_done);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X15, original_method);
+    arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X15);
+    arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_found);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 16);
+    arm64_writer_put_b_label(w, lbl_loop);
+
+    arm64_writer_put_label(w, lbl_found);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    arm64_writer_put_label(w, lbl_done);
+}
+
+static void emit_native_callback_call(Arm64Writer* w, HookCallback callback, void* user_data) {
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_SP, NATIVE_STACK_METHOD_SLOT_SIZE);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X1, (uint64_t)user_data);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)callback);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+}
+
 /* Generate a redirect thunk (pointer-based hooking, no inline patching).
  *
  * Layout: save context → call on_enter(ctx, user_data) → restore registers →
@@ -179,41 +275,47 @@ void* hook_remove_redirect(uint64_t key) {
 static void* generate_native_hook_thunk(HookCallback on_enter,
                                          void* user_data,
                                          uint64_t current_pc_hint,
+                                         uint64_t original_method,
                                          void* thunk_mem,
                                          size_t* thunk_size_out) {
     Arm64Writer w;
-    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
+    void* body_mem = (uint8_t*)thunk_mem + NATIVE_FAKE_OAT_PREFIX_SIZE;
+    size_t body_alloc = THUNK_ALLOC_SIZE - NATIVE_FAKE_OAT_PREFIX_SIZE;
+    arm64_writer_init(&w, body_mem, (uint64_t)body_mem, body_alloc);
 
-    uint64_t stack_size = 352;
-
-    /* Save HookContext.
-     * current_pc_hint != 0 时，表示这是从 compiled+router Java hook 进入的
-     * native thunk；此时 HookContext.pc 也暴露为原始方法内的可见 PC。 */
-    emit_save_hook_context(&w, current_pc_hint, 0);
+    emit_save_native_hook_context(&w, current_pc_hint);
+    emit_store_replacement_for_stackvisitor(&w, original_method);
 
     /* Call on_enter(ctx, user_data) */
-    emit_callback_call(&w, on_enter, user_data);
+    emit_native_callback_call(&w, on_enter, user_data);
 
     /* Restore x0 */
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE);
 
     /* 统一从 saved LR 恢复 (= jni_trampoline 内的返回地址)。
      * 不再区分 compiled/shared_stub 路径。让 RET 回到 jni_trampoline epilogue，
      * 由 GenericJniMethodEnd 正常清理 JNI transition frame，避免 frame 泄漏。 */
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240); /* saved LR */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 240); /* saved LR */
 
     /* Restore x18 (platform register) before returning */
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X18, ARM64_REG_SP, 144);
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X18, ARM64_REG_SP,
+                                        NATIVE_STACK_METHOD_SLOT_SIZE + 144);
 
     /* Deallocate stack + ret (thunk-level dec 废弃) */
-    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, NATIVE_TOTAL_FRAME_SIZE);
     arm64_writer_put_ret(&w);
 
     arm64_writer_flush(&w);
-    *thunk_size_out = arm64_writer_offset(&w);
+    size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
-    return thunk_mem;
+    backfill_native_fake_oat_header(thunk_mem, (uint32_t)body_size);
+    *thunk_size_out = NATIVE_FAKE_OAT_PREFIX_SIZE + body_size;
+    hook_flush_cache(thunk_mem, *thunk_size_out);
+
+    return body_mem;
 }
 
 /* Create a native hook trampoline — called by ART's JNI trampoline as a native function.
@@ -232,7 +334,7 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
     if (!thunk_mem) return NULL;
 
     size_t thunk_size = 0;
-    void* thunk = generate_native_hook_thunk(on_enter, user_data, current_pc_hint, thunk_mem, &thunk_size);
+    void* thunk = generate_native_hook_thunk(on_enter, user_data, current_pc_hint, key, thunk_mem, &thunk_size);
     if (!thunk) {
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;

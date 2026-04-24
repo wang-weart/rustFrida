@@ -565,7 +565,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
 ///
 /// 对标 Frida `unwrapMethodId(env.getStaticMethodId(...))`:
 /// API 30+ 可能返回 opaque jmethodID（bit 0 = 1），需解码为真实 ArtMethod*。
-unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
+pub(super) unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
     let c_class = CString::new("android/os/Process").unwrap();
     let c_method = CString::new("getElapsedCpuTime").unwrap();
     let c_sig = CString::new("()J").unwrap();

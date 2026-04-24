@@ -14,6 +14,13 @@ pub(super) enum HookType {
         replacement_addr: usize,
         per_method_hook_target: Option<u64>,
     },
+    /// Experimental quick callback hook.
+    /// Router calls Rust directly and only uses replacement_addr as a native
+    /// stack-walk sentinel while the callback is active.
+    Quick {
+        replacement_addr: usize,
+        per_method_hook_target: Option<u64>,
+    },
 }
 
 pub(super) struct JavaHookData {

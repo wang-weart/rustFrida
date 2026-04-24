@@ -20,6 +20,38 @@ pub(in crate::jsapi::java) fn set_replacement_method(original: u64, replacement:
     }
 }
 
+/// 注册 original → native replacement sentinel，并让 C 侧 router 直接回调 Rust quick path。
+pub(in crate::jsapi::java) fn set_quick_callback_method(
+    original: u64,
+    replacement: u64,
+    callback: hook_ffi::HookCallback,
+) {
+    // Do not insert into REPLACED_METHODS: that map drives ART DoCall
+    // original->replacement rewriting for the JNI-trampoline hook path.
+    // Quick hooks must be handled only by the C router table; otherwise an
+    // interpreted DoCall can jump into the native replacement sentinel.
+    unsafe {
+        hook_ffi::hook_art_router_table_add_quick(
+            original,
+            replacement,
+            callback,
+            original as *mut std::ffi::c_void,
+        );
+    }
+}
+
+pub(in crate::jsapi::java) fn set_quick_callback_method_mode(
+    original: u64,
+    replacement: u64,
+    callback: hook_ffi::HookCallback,
+    mode: u64,
+) {
+    set_quick_callback_method(original, replacement, callback);
+    unsafe {
+        hook_ffi::hook_art_router_table_set_mode(original, mode);
+    }
+}
+
 /// 查找 original 对应的 replacement（如果已注册）
 pub(super) fn get_replacement_method(original: u64) -> Option<u64> {
     REPLACED_METHODS.get_forward(original)

@@ -55,7 +55,6 @@ pub use runtime::JSRuntime;
 pub use value::JSValue;
 
 pub use lua::compile_lua_callback;
-pub use lua::script::load_lua_script;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -193,6 +192,12 @@ impl JSEngine {
         // Register all JavaScript APIs
         jsapi::register_all_apis(&context);
 
+        // 预缓存 hook callback 热路径用到的 atom（x0..x30 / sp / pc / lr / returnAddress /
+        // trampoline / __hookCtxPtr / __hookTrampoline），消除每次回调的 CString+JS_NewAtom 开销。
+        unsafe {
+            jsapi::callback_util::init_hot_atoms(context.as_ptr());
+        }
+
         Some(JSEngine { runtime, context })
     }
 
@@ -230,6 +235,12 @@ impl Drop for JSEngine {
         // 但 g_thunk_in_flight 可能仍 > 0，纯粹浪费时间）。
         //
         // 若 JSEngine 被独立 drop（非经 orchestrator），调用方负责先 cut/drain/free。
+        //
+        // Drop 顺序（字段声明顺序）：先 context（这里访问仍有效）→ 再 runtime。
+        // 在 context drop 前释放热路径 atom，让 JS_FreeAtom 有合法上下文。
+        unsafe {
+            jsapi::callback_util::free_hot_atoms(self.context.as_ptr());
+        }
     }
 }
 

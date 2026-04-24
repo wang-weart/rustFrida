@@ -475,11 +475,19 @@ where
     f()
 }
 
+/// 仅执行一次 ART 线程状态往返，确保 pending checkpoints 有机会运行。
+///
+/// 适用于已经在 native hook / Lua callback 中持有 JNIEnv 的线程，
+/// 但不想额外做 JNI 调用，只想给 ART 一个正式的 suspend/checkpoint 边界。
+pub(crate) unsafe fn run_pending_checkpoints(env: JniEnv) {
+    with_runnable_thread(env, || ());
+}
+
 // ============================================================================
 // jclass 解码
 // ============================================================================
 
-unsafe fn decode_jobject(env: JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
+pub(crate) unsafe fn decode_jobject(env: JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
     const DECODE_JOBJECT_SYMBOLS: [&str; 2] = [
         "_ZNK3art6Thread13DecodeJObjectEP8_jobject",
         "_ZN3art6Thread13DecodeJObjectEP8_jobject",

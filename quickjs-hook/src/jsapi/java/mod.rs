@@ -48,6 +48,14 @@ mod safe_mem;
 
 pub(crate) use jni_core::ensure_jni_initialized;
 pub(crate) use reflect::get_class_name_unchecked;
+pub(crate) use art_class::run_pending_checkpoints as run_pending_art_checkpoints;
+
+pub(crate) unsafe fn decode_jobject_raw(
+    env: jni_core::JniEnv,
+    obj: *mut std::ffi::c_void,
+) -> Option<u64> {
+    art_class::decode_jobject(env, obj)
+}
 
 use crate::context::JSContext;
 use crate::ffi;
@@ -447,6 +455,122 @@ unsafe extern "C" fn js_art_router_debug(
     JSValue::bool(true).raw()
 }
 
+unsafe extern "C" fn js_art_route_stats(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let mut miss_last_x0: u64 = 0;
+    let mut miss_count: u64 = 0;
+    let mut router_hits: u64 = 0;
+    let mut router_last_x0: u64 = 0;
+    let mut quick_hits: u64 = 0;
+    let mut replacement_hits: u64 = 0;
+    let mut do_call_table_hits: u64 = 0;
+    let mut do_call_last_x0: u64 = 0;
+    let mut quick_pass_hits: u64 = 0;
+    let mut quick_callback_calls: u64 = 0;
+    let mut quick_skip_hits: u64 = 0;
+
+    hook_ffi::hook_art_router_get_debug(&mut miss_last_x0, &mut miss_count);
+    hook_ffi::hook_art_router_get_hit_debug(&mut router_hits, &mut router_last_x0);
+    hook_ffi::hook_art_router_get_route_stats(
+        &mut quick_hits,
+        &mut replacement_hits,
+        &mut do_call_table_hits,
+        &mut do_call_last_x0,
+        &mut quick_pass_hits,
+        &mut quick_callback_calls,
+        &mut quick_skip_hits,
+    );
+
+    let obj = ffi::JS_NewObject(ctx);
+    let obj_val = JSValue(obj);
+    obj_val.set_property(ctx, "routerHits", JSValue(ffi::JS_NewBigUint64(ctx, router_hits)));
+    obj_val.set_property(ctx, "routerQuickHits", JSValue(ffi::JS_NewBigUint64(ctx, quick_hits)));
+    obj_val.set_property(ctx, "routerQuickPassHits", JSValue(ffi::JS_NewBigUint64(ctx, quick_pass_hits)));
+    obj_val.set_property(ctx, "routerQuickCallbackCalls", JSValue(ffi::JS_NewBigUint64(ctx, quick_callback_calls)));
+    obj_val.set_property(ctx, "routerQuickSkipHits", JSValue(ffi::JS_NewBigUint64(ctx, quick_skip_hits)));
+    obj_val.set_property(ctx, "routerReplacementHits", JSValue(ffi::JS_NewBigUint64(ctx, replacement_hits)));
+    obj_val.set_property(ctx, "routerLastX0", JSValue(ffi::JS_NewBigUint64(ctx, router_last_x0)));
+    obj_val.set_property(ctx, "routerMisses", JSValue(ffi::JS_NewBigUint64(ctx, miss_count)));
+    obj_val.set_property(ctx, "routerMissLastX0", JSValue(ffi::JS_NewBigUint64(ctx, miss_last_x0)));
+    obj_val.set_property(ctx, "doCallTotal", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::DO_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed))));
+    obj_val.set_property(ctx, "doCallReplacementHits", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::DO_CALL_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed))));
+    obj_val.set_property(ctx, "doCallQuickCallbackCalls", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::DO_CALL_QUICK_CALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed))));
+    obj_val.set_property(ctx, "doCallRouterTableHits", JSValue(ffi::JS_NewBigUint64(ctx, do_call_table_hits)));
+    obj_val.set_property(ctx, "doCallRouterLastX0", JSValue(ffi::JS_NewBigUint64(ctx, do_call_last_x0)));
+    obj_val.set_property(ctx, "getOatHookPoolOriginal", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::GET_OAT_HOOK_POOL_ORIGINAL_COUNT.load(std::sync::atomic::Ordering::Relaxed))));
+    obj_val.set_property(ctx, "getOatHookPoolReplacement", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::GET_OAT_HOOK_POOL_REPLACEMENT_COUNT.load(std::sync::atomic::Ordering::Relaxed))));
+    obj_val.set_property(ctx, "getOatHookPoolLastMethod", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::GET_OAT_HOOK_POOL_LAST_METHOD.load(std::sync::atomic::Ordering::Relaxed))));
+    obj_val.set_property(ctx, "getOatHookPoolLastPc", JSValue(ffi::JS_NewBigUint64(ctx, art_controller::GET_OAT_HOOK_POOL_LAST_PC.load(std::sync::atomic::Ordering::Relaxed))));
+    obj
+}
+
+unsafe extern "C" fn js_reset_art_route_stats(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    hook_ffi::hook_art_router_reset_debug();
+    art_controller::DO_CALL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    art_controller::DO_CALL_HIT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    art_controller::DO_CALL_QUICK_CALLBACK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    art_controller::GET_OAT_HOOK_POOL_ORIGINAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    art_controller::GET_OAT_HOOK_POOL_REPLACEMENT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    art_controller::GET_OAT_HOOK_POOL_LAST_METHOD.store(0, std::sync::atomic::Ordering::Relaxed);
+    art_controller::GET_OAT_HOOK_POOL_LAST_PC.store(0, std::sync::atomic::Ordering::Relaxed);
+    JSValue::bool(true).raw()
+}
+
+unsafe extern "C" fn js_lua_callback_stats(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let (
+        total,
+        active,
+        max_active,
+        thread_states,
+        orig_requests,
+        native_enter,
+        native_leave,
+        native_fail,
+    ) = crate::lua::callback_stats();
+    let obj = ffi::JS_NewObject(ctx);
+    let obj_val = JSValue(obj);
+    let (quick_active, quick_oldest_age, quick_drop_begin, quick_drop_end, quick_diag) =
+        crate::lua::callback::quick_diag_snapshot();
+    obj_val.set_property(ctx, "total", JSValue(ffi::JS_NewBigUint64(ctx, total)));
+    obj_val.set_property(ctx, "active", JSValue(ffi::JS_NewBigUint64(ctx, active)));
+    obj_val.set_property(ctx, "maxActive", JSValue(ffi::JS_NewBigUint64(ctx, max_active)));
+    obj_val.set_property(ctx, "threadStates", JSValue(ffi::JS_NewBigUint64(ctx, thread_states)));
+    obj_val.set_property(ctx, "origRequests", JSValue(ffi::JS_NewBigUint64(ctx, orig_requests)));
+    obj_val.set_property(ctx, "nativeEnter", JSValue(ffi::JS_NewBigUint64(ctx, native_enter)));
+    obj_val.set_property(ctx, "nativeLeave", JSValue(ffi::JS_NewBigUint64(ctx, native_leave)));
+    obj_val.set_property(ctx, "nativeFail", JSValue(ffi::JS_NewBigUint64(ctx, native_fail)));
+    obj_val.set_property(ctx, "quickActive", JSValue(ffi::JS_NewBigUint64(ctx, quick_active)));
+    obj_val.set_property(ctx, "quickOldestAgeMs", JSValue(ffi::JS_NewBigUint64(ctx, quick_oldest_age)));
+    obj_val.set_property(ctx, "quickDropBegin", JSValue(ffi::JS_NewBigUint64(ctx, quick_drop_begin)));
+    obj_val.set_property(ctx, "quickDropEnd", JSValue(ffi::JS_NewBigUint64(ctx, quick_drop_end)));
+    obj_val.set_property(ctx, "quickDiag", JSValue::string(ctx, &quick_diag));
+    obj
+}
+
+unsafe extern "C" fn js_reset_lua_callback_stats(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    crate::lua::reset_callback_stats();
+    JSValue::bool(true).raw()
+}
+
 /// JS CFunction: Java.setStealth(mode) — 设置 stealth 模式
 ///
 /// mode: Hook.NORMAL (0) / false, Hook.WXSHADOW (1) / true, Hook.RECOMP (2)
@@ -762,6 +886,7 @@ pub fn register_java_api(ctx: &JSContext) {
 
         let ctx_ptr = ctx.as_ptr();
         add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
+        add_cfunction_to_object(ctx_ptr, java_obj, "hookQuick", js_java_hook_quick, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "luaHook", js_lua_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "deopt", js_java_deopt, 0);
@@ -771,6 +896,10 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_artRouteStats", js_art_route_stats, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_resetArtRouteStats", js_reset_art_route_stats, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_luaCallbackStats", js_lua_callback_stats, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_resetLuaCallbackStats", js_reset_lua_callback_stats, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
         // Instance method invocation helper used by Java object proxies
         add_cfunction_to_object(ctx_ptr, java_obj, "_invokeMethod", js_java_invoke_method, 4);
@@ -893,10 +1022,13 @@ pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
 
 /// 移除 Layer 3 per-method inline hook + stealth2 revert_slot_patch。
 pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
-    if let callback::HookType::Replaced { per_method_hook_target, .. } = &data.hook_type {
+    match &data.hook_type {
+        callback::HookType::Replaced { per_method_hook_target, .. }
+        | callback::HookType::Quick { per_method_hook_target, .. } => {
         if let Some(target) = per_method_hook_target {
             hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
             let _ = crate::recomp::revert_slot_patch(data.original_entry_point as usize);
+        }
         }
     }
 }
@@ -908,10 +1040,12 @@ pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
 
 /// 释放 replacement ArtMethod 堆内存 + JNI global ref + JS callback。
 pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
-    if let callback::HookType::Replaced { replacement_addr, .. } = &data.hook_type {
-        if *replacement_addr != 0 {
-            libc::free(*replacement_addr as *mut std::ffi::c_void);
-        }
+    let replacement_addr = match &data.hook_type {
+        callback::HookType::Replaced { replacement_addr, .. }
+        | callback::HookType::Quick { replacement_addr, .. } => *replacement_addr,
+    };
+    if replacement_addr != 0 {
+        libc::free(replacement_addr as *mut std::ffi::c_void);
     }
 
     if data.class_global_ref != 0 {

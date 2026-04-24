@@ -9,10 +9,142 @@ use crate::jsapi::ptr::get_native_pointer_addr;
 use crate::jsapi::util::JSCFn;
 use crate::value::JSValue;
 use crate::JSEngine;
+use std::cell::UnsafeCell;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::MutexGuard;
 
 const JS_MAX_SAFE_INTEGER: u64 = 1u64 << 53;
+
+// ──────────────────────────────────────────────────────────────────────────
+// 热路径 atom 缓存
+//
+// 每次 hook callback 原本要为 x0..x30 + sp/pc/lr/returnAddress/trampoline/
+// __hookCtxPtr/__hookTrampoline 共 ~37 个属性名反复 CString::new + JS_NewAtom +
+// JS_FreeAtom，在高频 hook 下制造大量 Rust 堆 / QuickJS atom 表抖动。
+//
+// 这里在 JSEngine 构造时一次性 `JS_NewAtom` 全部热点名字，跨线程以 JS_ENGINE
+// Mutex 为串行点 (hot path 永远在持锁期间读取)。JSRuntime 销毁前 (JSEngine::drop)
+// 显式 JS_FreeAtom 归还引用。
+//
+// 字段布局固定，callback 直接按下标取，无哈希/查表开销。
+// ──────────────────────────────────────────────────────────────────────────
+
+#[repr(C)]
+pub(crate) struct HotAtoms {
+    // ─── native hook (replace + attach) ──────────────────────────
+    pub x: [ffi::JSAtom; 31],
+    pub sp: ffi::JSAtom,
+    pub pc: ffi::JSAtom,
+    pub lr: ffi::JSAtom,
+    pub return_address: ffi::JSAtom,
+    pub trampoline: ffi::JSAtom,
+    pub hook_ctx_ptr: ffi::JSAtom,
+    pub hook_trampoline: ffi::JSAtom,
+    // ─── java hook ───────────────────────────────────────────────
+    pub this_obj: ffi::JSAtom,
+    pub env: ffi::JSAtom,
+    pub hook_art_method: ffi::JSAtom,
+    pub args: ffi::JSAtom,
+    pub orig_jobject: ffi::JSAtom,
+    pub jptr: ffi::JSAtom,
+}
+
+impl HotAtoms {
+    const fn zeros() -> Self {
+        Self {
+            x: [0; 31],
+            sp: 0,
+            pc: 0,
+            lr: 0,
+            return_address: 0,
+            trampoline: 0,
+            hook_ctx_ptr: 0,
+            hook_trampoline: 0,
+            this_obj: 0,
+            env: 0,
+            hook_art_method: 0,
+            args: 0,
+            orig_jobject: 0,
+            jptr: 0,
+        }
+    }
+}
+
+pub(crate) struct HotAtomsCell(UnsafeCell<HotAtoms>);
+// Safety: 变更只发生在 init_hot_atoms / free_hot_atoms（都在 JS_ENGINE 锁下调用）,
+// hot path 读取也必然在 JS_ENGINE 锁下。
+unsafe impl Sync for HotAtomsCell {}
+
+pub(crate) static HOT_ATOMS: HotAtomsCell = HotAtomsCell(UnsafeCell::new(HotAtoms::zeros()));
+pub(crate) static HOT_ATOMS_READY: AtomicBool = AtomicBool::new(false);
+
+unsafe fn new_atom_cstr(ctx: *mut ffi::JSContext, name: &str) -> ffi::JSAtom {
+    let c = CString::new(name).unwrap();
+    ffi::JS_NewAtom(ctx, c.as_ptr())
+}
+
+/// 初始化热路径 atom 缓存。调用方必须持有 JS_ENGINE 锁并提供合法 ctx。
+/// 幂等：已初始化时直接返回。
+pub(crate) unsafe fn init_hot_atoms(ctx: *mut ffi::JSContext) {
+    if HOT_ATOMS_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let atoms = &mut *HOT_ATOMS.0.get();
+    for i in 0..31 {
+        atoms.x[i] = new_atom_cstr(ctx, &format!("x{}", i));
+    }
+    atoms.sp = new_atom_cstr(ctx, "sp");
+    atoms.pc = new_atom_cstr(ctx, "pc");
+    atoms.lr = new_atom_cstr(ctx, "lr");
+    atoms.return_address = new_atom_cstr(ctx, "returnAddress");
+    atoms.trampoline = new_atom_cstr(ctx, "trampoline");
+    atoms.hook_ctx_ptr = new_atom_cstr(ctx, "__hookCtxPtr");
+    atoms.hook_trampoline = new_atom_cstr(ctx, "__hookTrampoline");
+    atoms.this_obj = new_atom_cstr(ctx, "thisObj");
+    atoms.env = new_atom_cstr(ctx, "env");
+    atoms.hook_art_method = new_atom_cstr(ctx, "__hookArtMethod");
+    atoms.args = new_atom_cstr(ctx, "args");
+    atoms.orig_jobject = new_atom_cstr(ctx, "__origJobject");
+    atoms.jptr = new_atom_cstr(ctx, "__jptr");
+    HOT_ATOMS_READY.store(true, Ordering::Release);
+}
+
+/// 释放热路径 atom。必须在 JSContext 仍有效时调用 (JSEngine::drop 里, context 字段 drop 之前)。
+/// 幂等。
+pub(crate) unsafe fn free_hot_atoms(ctx: *mut ffi::JSContext) {
+    if !HOT_ATOMS_READY.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let atoms = &mut *HOT_ATOMS.0.get();
+    for i in 0..31 {
+        if atoms.x[i] != 0 {
+            ffi::JS_FreeAtom(ctx, atoms.x[i]);
+            atoms.x[i] = 0;
+        }
+    }
+    macro_rules! free_field {
+        ($($f:ident),+ $(,)?) => {
+            $(
+                if atoms.$f != 0 {
+                    ffi::JS_FreeAtom(ctx, atoms.$f);
+                    atoms.$f = 0;
+                }
+            )+
+        };
+    }
+    free_field!(
+        sp, pc, lr, return_address, trampoline, hook_ctx_ptr, hook_trampoline,
+        this_obj, env, hook_art_method, args, orig_jobject, jptr,
+    );
+}
+
+/// 读取热路径 atom 缓存。调用方必须持有 JS_ENGINE 锁。
+#[inline]
+pub(crate) unsafe fn hot_atoms() -> &'static HotAtoms {
+    debug_assert!(HOT_ATOMS_READY.load(Ordering::Relaxed), "hot atoms not initialized");
+    &*HOT_ATOMS.0.get()
+}
 
 pub(crate) enum JsEngineCallbackGuard {
     Locked {
@@ -265,14 +397,42 @@ pub(crate) unsafe fn throw_internal_error(ctx: *mut ffi::JSContext, message: imp
     )
 }
 
-/// Set a u64 property on a JS object as BigUint64.
-/// 封装 CString → JS_NewAtom → JS_NewBigUint64 → qjs_set_property → JS_FreeAtom 模式。
+/// Set a u64 property on a JS object. Uses Number for values ≤ 2^53, BigUint64 otherwise.
+///
+/// 封装 CString → JS_NewAtom → (Number | BigUint64) → qjs_set_property → JS_FreeAtom。
+/// 热路径应直接用 `set_js_u64_property_atom` 跳过 CString / atom 分配。
 pub(crate) unsafe fn set_js_u64_property(ctx: *mut ffi::JSContext, obj: ffi::JSValue, name: &str, value: u64) {
     let cname = std::ffi::CString::new(name).unwrap();
     let atom = ffi::JS_NewAtom(ctx, cname.as_ptr());
-    let val = ffi::JS_NewBigUint64(ctx, value);
+    let val = js_u64_to_js_number_or_bigint(ctx, value);
     ffi::qjs_set_property(ctx, obj, atom, val);
     ffi::JS_FreeAtom(ctx, atom);
+}
+
+/// Atom 版 u64 属性写入：直接用预缓存 atom，不做 CString/atom 分配，值走 Number-or-BigInt。
+#[inline]
+pub(crate) unsafe fn set_js_u64_property_atom(
+    ctx: *mut ffi::JSContext,
+    obj: ffi::JSValue,
+    atom: ffi::JSAtom,
+    value: u64,
+) {
+    let val = js_u64_to_js_number_or_bigint(ctx, value);
+    ffi::qjs_set_property(ctx, obj, atom, val);
+}
+
+/// Atom 版通用属性写入：调用方已构造好 value，跳过 CString/atom 分配。
+///
+/// qjs_set_property 接管 value 的引用计数（成功时消耗，失败时也会 free），
+/// 语义与 JSValue::set_property 一致。
+#[inline]
+pub(crate) unsafe fn set_js_value_property_atom(
+    ctx: *mut ffi::JSContext,
+    obj: ffi::JSValue,
+    atom: ffi::JSAtom,
+    value: ffi::JSValue,
+) {
+    ffi::qjs_set_property(ctx, obj, atom, value);
 }
 
 /// Set a CFunction property on a JS object.
@@ -293,6 +453,20 @@ pub(crate) unsafe fn get_js_u64_property(ctx: *mut ffi::JSContext, obj: ffi::JSV
     let prop = JSValue(obj).get_property(ctx, name);
     let value = prop.to_u64(ctx).unwrap_or(0);
     prop.free(ctx);
+    value
+}
+
+/// Atom 版 u64 属性读取：绕开 CString / atom 临时分配。
+#[inline]
+pub(crate) unsafe fn get_js_u64_property_atom(
+    ctx: *mut ffi::JSContext,
+    obj: ffi::JSValue,
+    atom: ffi::JSAtom,
+) -> u64 {
+    let prop = ffi::qjs_get_property(ctx, obj, atom);
+    let jv = JSValue(prop);
+    let value = jv.to_u64(ctx).unwrap_or(0);
+    jv.free(ctx);
     value
 }
 

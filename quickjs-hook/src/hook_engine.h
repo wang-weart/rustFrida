@@ -167,6 +167,13 @@ int hook_engine_get_pool_ranges(ExecPoolRange* out, int cap);
 /* 清空快照（Rust 在 munmap 完成后调用，防止跨次 cleanup 误认） */
 void hook_engine_clear_pool_ranges(void);
 
+/*
+ * Returns non-zero if pc belongs to any executable memory pool owned by the
+ * hook engine. Used by ART stack-walk diagnostics to detect managed frames
+ * whose return PC points into generated router code.
+ */
+int hook_is_in_exec_pool(uint64_t pc);
+
 /* Thunk 在途计数。由 thunk 入口 LDADDAL inc, 出口 LDADDAL dec 直接配对。
  * cleanup 侧：
  *   1. 先反装所有 hook (切断新入口)
@@ -318,6 +325,9 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
 typedef struct {
     uint64_t original;      /* Original ArtMethod* (0 = sentinel / end marker) */
     uint64_t replacement;   /* Replacement ArtMethod* */
+    uint64_t mode;          /* 0 = replacement ArtMethod, 1 = quick callback */
+    HookCallback quick_callback;
+    void* quick_user_data;
 } ArtRouterEntry;
 
 /*
@@ -329,6 +339,17 @@ typedef struct {
  * @return              0 on success, -1 if table full
  */
 int hook_art_router_table_add(uint64_t original, uint64_t replacement);
+
+/*
+ * Add an entry routed directly to a native quick callback.
+ * The replacement ArtMethod is still used as a native stack-walk sentinel
+ * while the callback runs, but execution does not go through ART's JNI
+ * trampoline. The callback receives (HookContext*, user_data).
+ */
+int hook_art_router_table_add_quick(uint64_t original, uint64_t replacement,
+                                    HookCallback callback, void* user_data);
+
+void hook_art_router_table_set_mode(uint64_t original, uint64_t mode);
 
 /*
  * Remove an entry from the ART router lookup table.
@@ -349,6 +370,13 @@ void hook_art_router_table_clear(void);
  * Returns 0 if not found.
  */
 uint64_t hook_art_router_table_lookup_original(uint64_t replacement);
+
+/*
+ * Debug/statistics: called from ART DoCall hook to record whether an interpreted
+ * call targets an ArtMethod currently present in the C router table.
+ * Returns 1 for quick callback entries, 2 for replacement entries, 0 if absent.
+ */
+int hook_art_router_record_do_call(uint64_t method);
 
 /* Fast $orig bypass — skip art_router prologue+scan when callOriginal is in progress.
  * Array of per-thread slots checked at thunk entry BEFORE register save.
@@ -378,14 +406,17 @@ void orig_bypass_clear(uint64_t thread);
 #define FAST_ORIG_SLOTS 4
 typedef struct {
     volatile uint64_t thread;   /* TPIDR_EL0, 0 = free slot */
-    uint64_t _pad[3];
+    volatile uint64_t method;   /* original ArtMethod* for post-callback orig */
+    volatile uint64_t trampoline; /* relocated original entry */
+    uint64_t _pad;
 } FastOrigSlot;
 
 extern FastOrigSlot g_fast_orig_slots[FAST_ORIG_SLOTS];
 extern volatile uint64_t g_fast_orig_active;
 
-int fast_orig_set(uint64_t thread);
+int fast_orig_set(uint64_t thread, uint64_t method, uint64_t trampoline);
 void fast_orig_clear(uint64_t thread);
+uint64_t fast_orig_current_frame(uint64_t thread);
 
 /*
  * Dump all entries in the ART router lookup table (via hook_log).
@@ -413,6 +444,17 @@ void hook_art_router_get_debug(uint64_t* last_x0, uint64_t* miss_count);
  * Get hit counter for found path + last matched X0.
  */
 void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0);
+
+/*
+ * Debug: split route counters for quick/replacement router hits and DoCall hits.
+ */
+void hook_art_router_get_route_stats(uint64_t* quick_hits,
+                                     uint64_t* replacement_hits,
+                                     uint64_t* do_call_table_hits,
+                                     uint64_t* last_do_call_x0,
+                                     uint64_t* quick_pass_hits,
+                                     uint64_t* quick_callback_calls,
+                                     uint64_t* quick_skip_hits);
 
 /*
  * Debug: reset the not_found X0 capture and miss counter.
@@ -445,6 +487,13 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int skip_resolve,
                                uint64_t current_pc_hint,
                                int use_blr);
+
+/*
+ * Return the generated ART router thunk body for a hooked quickCode target.
+ * The returned address is entry_point compatible (fake OAT header lives
+ * immediately before it). Returns NULL if target is not currently hooked.
+ */
+void* hook_art_router_get_thunk_body(void* target);
 
 /*
  * Resolve tiny ART trampolines (LDR Xt,[X19,#imm]; BR Xt) to actual target.

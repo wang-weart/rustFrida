@@ -6,9 +6,9 @@
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
-    acquire_js_engine_for_callback, get_js_u64_property, handle_js_exception,
+    acquire_js_engine_for_callback, get_js_u64_property_atom, handle_js_exception, hot_atoms,
     invoke_hook_callback_common, js_u64_to_js_number_or_bigint, js_value_to_u64_or_zero,
-    set_js_cfunction_property, set_js_u64_property,
+    set_js_cfunction_property, set_js_u64_property_atom,
 };
 use std::cell::RefCell;
 use std::sync::{Condvar, Mutex};
@@ -160,18 +160,18 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         |ctx| {
             let js_ctx = ffi::JS_NewObject(ctx);
             let hook_ctx = &*ctx_ptr;
+            let atoms = hot_atoms();
 
             for i in 0..31 {
-                let prop_name = format!("x{}", i);
-                set_js_u64_property(ctx, js_ctx, &prop_name, hook_ctx.x[i]);
+                set_js_u64_property_atom(ctx, js_ctx, atoms.x[i], hook_ctx.x[i]);
             }
-            set_js_u64_property(ctx, js_ctx, "sp", hook_ctx.sp);
-            set_js_u64_property(ctx, js_ctx, "pc", hook_ctx.pc);
-            set_js_u64_property(ctx, js_ctx, "trampoline", trampoline);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.sp, hook_ctx.sp);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.pc, hook_ctx.pc);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.trampoline, trampoline);
             // Bind callback-local state to the context object so ctx.orig() remains stable
             // even if nested hooks temporarily overwrite the global fallback state.
-            set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", ctx_ptr as usize as u64);
-            set_js_u64_property(ctx, js_ctx, "__hookTrampoline", trampoline);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, ctx_ptr as usize as u64);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_trampoline, trampoline);
             set_js_cfunction_property(ctx, js_ctx, "orig", js_native_call_original, 0);
 
             js_ctx
@@ -183,9 +183,9 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         |ctx, js_ctx, result| {
             result_was_set = true;
             // 同步 JS ctx 属性 → C HookContext（用户可能修改了 ctx.x0 等）
-            for i in 0..31u32 {
-                let prop_name = format!("x{}", i);
-                (*ctx_ptr).x[i as usize] = get_js_u64_property(ctx, js_ctx, &prop_name);
+            let atoms = hot_atoms();
+            for i in 0..31 {
+                (*ctx_ptr).x[i] = get_js_u64_property_atom(ctx, js_ctx, atoms.x[i]);
             }
             // 显式 return 值覆盖 x0
             let result_val = ffi::JSValue {
@@ -222,8 +222,9 @@ unsafe extern "C" fn js_native_call_original(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    let atoms = hot_atoms();
     let ctx_ptr = {
-        let value = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
+        let value = get_js_u64_property_atom(ctx, this_val, atoms.hook_ctx_ptr) as *mut hook_ffi::HookContext;
         if !value.is_null() {
             value
         } else {
@@ -233,7 +234,7 @@ unsafe extern "C" fn js_native_call_original(
         }
     };
     let trampoline = {
-        let value = get_js_u64_property(ctx, this_val, "__hookTrampoline");
+        let value = get_js_u64_property_atom(ctx, this_val, atoms.hook_trampoline);
         if value != 0 {
             value
         } else {
@@ -253,10 +254,9 @@ unsafe extern "C" fn js_native_call_original(
     // 同步 JS ctx 属性到 C HookContext（用户可能修改了 ctx.x0 等）
     let hook_ctx = &mut *ctx_ptr;
     for i in 0..31 {
-        let prop_name = format!("x{}", i);
-        hook_ctx.x[i] = get_js_u64_property(ctx, this_val, &prop_name);
+        hook_ctx.x[i] = get_js_u64_property_atom(ctx, this_val, atoms.x[i]);
     }
-    hook_ctx.sp = get_js_u64_property(ctx, this_val, "sp");
+    hook_ctx.sp = get_js_u64_property_atom(ctx, this_val, atoms.sp);
 
     // 如果 orig() 传了参数，按顺序覆盖 x0-xN (最多 x0-x30)
     let max_args = (argc as usize).min(31);
@@ -272,7 +272,7 @@ unsafe extern "C" fn js_native_call_original(
     (*ctx_ptr).x[0] = result;
 
     // 同步返回值到 JS ctx.x0 属性，使 ctx.orig() 后读 ctx.x0 能拿到返回值
-    set_js_u64_property(ctx, this_val, "x0", result);
+    set_js_u64_property_atom(ctx, this_val, atoms.x[0], result);
 
     // Return value: Number (≤2^53) or BigUint64
     js_u64_to_js_number_or_bigint(ctx, result)
@@ -311,14 +311,15 @@ unsafe fn build_invocation_ctx(
 ) -> ffi::JSValue {
     let js_ctx = ffi::JS_NewObject(ctx);
     let hook_ctx = &*hook_ctx_ptr;
+    let atoms = hot_atoms();
     for i in 0..31 {
-        set_js_u64_property(ctx, js_ctx, &format!("x{}", i), hook_ctx.x[i]);
+        set_js_u64_property_atom(ctx, js_ctx, atoms.x[i], hook_ctx.x[i]);
     }
-    set_js_u64_property(ctx, js_ctx, "sp", hook_ctx.sp);
-    set_js_u64_property(ctx, js_ctx, "pc", hook_ctx.pc);
-    set_js_u64_property(ctx, js_ctx, "lr", hook_ctx.x[30]);
-    set_js_u64_property(ctx, js_ctx, "returnAddress", hook_ctx.x[30]);
-    set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", hook_ctx_ptr as usize as u64);
+    set_js_u64_property_atom(ctx, js_ctx, atoms.sp, hook_ctx.sp);
+    set_js_u64_property_atom(ctx, js_ctx, atoms.pc, hook_ctx.pc);
+    set_js_u64_property_atom(ctx, js_ctx, atoms.lr, hook_ctx.x[30]);
+    set_js_u64_property_atom(ctx, js_ctx, atoms.return_address, hook_ctx.x[30]);
+    set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, hook_ctx_ptr as usize as u64);
     js_ctx
 }
 
@@ -329,10 +330,11 @@ unsafe fn sync_js_ctx_to_hook_ctx(
     hook_ctx_ptr: *mut hook_ffi::HookContext,
 ) {
     let hook_ctx = &mut *hook_ctx_ptr;
+    let atoms = hot_atoms();
     for i in 0..31 {
-        hook_ctx.x[i] = get_js_u64_property(ctx, js_ctx, &format!("x{}", i));
+        hook_ctx.x[i] = get_js_u64_property_atom(ctx, js_ctx, atoms.x[i]);
     }
-    hook_ctx.sp = get_js_u64_property(ctx, js_ctx, "sp");
+    hook_ctx.sp = get_js_u64_property_atom(ctx, js_ctx, atoms.sp);
 }
 
 /// 调用 JS 全局 helper `helper_name(userFn, js_ctx)`。
@@ -477,8 +479,9 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
 
     // 刷新 x0-x30 到 js_ctx（trampoline 刚返回，x0 已是新的返回值）
     let hook_ctx = &*ctx_ptr;
+    let atoms = hot_atoms();
     for i in 0..31 {
-        set_js_u64_property(ctx, js_ctx, &format!("x{}", i), hook_ctx.x[i]);
+        set_js_u64_property_atom(ctx, js_ctx, atoms.x[i], hook_ctx.x[i]);
     }
 
     call_interceptor_helper(ctx, &on_leave_bytes, js_ctx, b"__interceptorLeave\0", "interceptor.onLeave");

@@ -394,10 +394,8 @@ pub(crate) unsafe fn invoke_original_jni(
 
     let thread_id = crate::current_thread_id_u64();
 
-    // BLR fast $orig: 暂未启用 — do_orig 汇编路径需要 on-device dump 调试
-    // if use_blr && hook_ffi::fast_orig_set(thread_id) == 0 {
-    //     return 0;
-    // }
+    // Generic JNI entry point does not have the original HookContext here, so
+    // only callers that can patch the router frame should use the BLR fast path.
 
     // Fallback: full JNI path
     crate::jsapi::java::art_controller::set_call_original_bypass(art_method_addr);
@@ -563,6 +561,79 @@ pub(crate) unsafe fn build_jargs_from_registers(
     jargs
 }
 
+#[inline]
+fn is_object_sig(type_sig: Option<&str>) -> bool {
+    matches!(type_sig, Some(s) if s.starts_with('L') || s.starts_with('['))
+}
+
+/// Patch the router frame's saved quick object registers from live JNI refs.
+///
+/// The BLR fast-orig path keeps the router frame across the replacement JNI
+/// callback. Object values saved there are raw mirror pointers and are not GC
+/// roots. If GC moves objects while the script callback runs, restoring those
+/// raw values will crash in original quick code. Before setting the fast-orig
+/// flag, decode the callback's live JNI transition refs to fresh mirror
+/// pointers and write them back to the saved quick register slots.
+pub(crate) unsafe fn prepare_fast_orig_router_frame(
+    env: JniEnv,
+    hook_ctx: &hook_ffi::HookContext,
+    is_static: bool,
+    param_count: usize,
+    param_types: &[String],
+) -> bool {
+    if env.is_null() {
+        return false;
+    }
+
+    let thread_id = crate::current_thread_id_u64();
+    let frame = hook_ffi::fast_orig_current_frame(thread_id) as *mut u64;
+    if frame.is_null() {
+        return false;
+    }
+
+    const ROUTER_X1_WORD: usize = 80 / 8;
+
+    if !is_static {
+        let receiver_ref = hook_ctx.x[1] as *mut std::ffi::c_void;
+        if receiver_ref.is_null() {
+            return false;
+        }
+        let Some(receiver_raw) = crate::jsapi::java::art_class::decode_jobject(env, receiver_ref) else {
+            return false;
+        };
+        *frame.add(ROUTER_X1_WORD) = receiver_raw;
+    }
+
+    let mut gp_index: usize = 0;
+    let mut fp_index: usize = 0;
+    for i in 0..param_count {
+        let type_sig = param_types.get(i).map(|s| s.as_str());
+        let is_fp = is_floating_point_type(type_sig);
+        let (gp_val, _fp_val) = extract_jni_arg(hook_ctx, is_fp, &mut gp_index, &mut fp_index);
+        if !is_object_sig(type_sig) || gp_val == 0 {
+            continue;
+        }
+
+        let quick_reg_index = if is_static {
+            1usize.saturating_add(gp_index - 1)
+        } else {
+            2usize.saturating_add(gp_index - 1)
+        };
+        if quick_reg_index >= 8 {
+            return false;
+        }
+
+        let Some(raw) =
+            crate::jsapi::java::art_class::decode_jobject(env, gp_val as *mut std::ffi::c_void)
+        else {
+            return false;
+        };
+        *frame.add(ROUTER_X1_WORD + quick_reg_index - 1) = raw;
+    }
+
+    true
+}
+
 /// JS CFunction: ctx.orig() or ctx.orig(arg0, arg1, ...)
 ///
 /// No arguments: invokes the original method with the original register arguments.
@@ -578,8 +649,9 @@ unsafe extern "C" fn js_call_original(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let art_method_addr = get_js_u64_property(ctx, this_val, "__hookArtMethod");
-    let ctx_ptr = get_js_u64_property(ctx, this_val, "__hookCtxPtr") as *mut hook_ffi::HookContext;
+    let atoms = hot_atoms();
+    let art_method_addr = get_js_u64_property_atom(ctx, this_val, atoms.hook_art_method);
+    let ctx_ptr = get_js_u64_property_atom(ctx, this_val, atoms.hook_ctx_ptr) as *mut hook_ffi::HookContext;
     if ctx_ptr.is_null() || art_method_addr == 0 {
         return ffi::JS_ThrowInternalError(
             ctx,
@@ -659,6 +731,24 @@ unsafe extern "C" fn js_call_original(
     } else {
         std::ptr::null()
     };
+
+    if use_blr
+        && quick_trampoline != 0
+        && prepare_fast_orig_router_frame(env, hook_ctx, is_static, param_count, &param_types)
+    {
+        let thread_id = crate::current_thread_id_u64();
+        if hook_ffi::fast_orig_set(thread_id, art_method_addr, quick_trampoline) == 0 {
+            return match return_type {
+                b'V' => ffi::qjs_undefined(),
+                b'Z' => JSValue::bool(false).raw(),
+                b'I' | b'B' | b'C' | b'S' => JSValue::int(0).raw(),
+                b'J' => ffi::JS_NewBigUint64(ctx, 0),
+                b'F' | b'D' => JSValue::float(0.0).raw(),
+                b'L' | b'[' => ffi::qjs_null(),
+                _ => ffi::qjs_undefined(),
+            };
+        }
+    }
 
     let ret_raw = invoke_original_jni(
         env,

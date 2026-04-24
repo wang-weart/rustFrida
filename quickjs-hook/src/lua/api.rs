@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 当前 callback 线程的 JNIEnv (TLS-like, 用于 jstr 等 API)
 std::thread_local! {
     static CURRENT_ENV: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAST_ORIG_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static QUICK_ORIG_RESULT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn set_current_env(env: *const std::ffi::c_void) {
@@ -17,6 +19,38 @@ pub(crate) fn clear_current_env() {
 
 pub(crate) fn get_current_env() -> *const std::ffi::c_void {
     CURRENT_ENV.with(|c| c.get() as *const std::ffi::c_void)
+}
+
+pub(crate) fn clear_fast_orig_requested() {
+    FAST_ORIG_REQUESTED.with(|c| c.set(false));
+}
+
+pub(crate) fn mark_fast_orig_requested() {
+    FAST_ORIG_REQUESTED.with(|c| c.set(true));
+}
+
+pub(crate) fn take_fast_orig_requested() -> bool {
+    FAST_ORIG_REQUESTED.with(|c| {
+        let v = c.get();
+        c.set(false);
+        v
+    })
+}
+
+pub(crate) fn clear_quick_orig_result() {
+    QUICK_ORIG_RESULT.with(|c| c.set(None));
+}
+
+pub(crate) fn set_quick_orig_result(raw: u64) {
+    QUICK_ORIG_RESULT.with(|c| c.set(Some(raw)));
+}
+
+pub(crate) fn take_quick_orig_result() -> Option<u64> {
+    QUICK_ORIG_RESULT.with(|c| {
+        let v = c.get();
+        c.set(None);
+        v
+    })
 }
 
 pub(crate) unsafe fn register_lua_apis(state: &LuaState) {
@@ -43,15 +77,9 @@ unsafe extern "C" fn lua_print(L: *mut ffi::lua_State) -> std::os::raw::c_int {
                 parts.push("nil".to_string());
             }
         } else if tp == ffi::LUA_TLIGHTUSERDATA as i32 {
-            // lightuserdata = Java 对象, 自动尝试 toString
+            // Keep print() side-effect free in hook callbacks. Users can call
+            // jstr(obj) explicitly when they want JNI Object.toString().
             let ptr = ffi::lua_touserdata(L, i) as u64;
-            let env = get_current_env();
-            if ptr != 0 && !env.is_null() {
-                if let Some(s) = jni_tostring(ptr, env) {
-                    parts.push(s);
-                    continue;
-                }
-            }
             parts.push(format!("0x{:x}", ptr));
         } else {
             match tp as u32 {
@@ -255,7 +283,7 @@ pub(crate) unsafe extern "C" fn lua_call_original(
     let nargs = ffi::lua_gettop(L);
     let user_arg_count = nargs - 1; // 减去 self
 
-    let (jargs_ptr, jargs_buf) = if user_arg_count > 0 && user_arg_count as usize == cb_ctx.param_count {
+    let (this_obj, jargs_ptr, jargs_buf) = if user_arg_count > 0 && user_arg_count as usize == cb_ctx.param_count {
         // 自定义参数: Lua → JNI jvalue 转换
         let mut jargs: Vec<u64> = Vec::with_capacity(cb_ctx.param_count);
         for i in 0..cb_ctx.param_count {
@@ -263,22 +291,69 @@ pub(crate) unsafe extern "C" fn lua_call_original(
             let type_sig = cb_ctx.param_types.get(i).map(|s| s.as_str());
             jargs.push(lua_to_jvalue(L, lua_idx, type_sig, cb_ctx.env));
         }
-        (jargs.as_ptr() as *const std::ffi::c_void, Some(jargs))
+        (cb_ctx.this_obj, jargs.as_ptr() as *const std::ffi::c_void, Some(jargs))
     } else {
-        // 原始参数
-        (cb_ctx.jargs_ptr, None)
+        // 原始参数: 对齐 JS $orig，调用瞬间从 HookContext 寄存器重建，
+        // 避免在高频/GC 下使用进入 callback 时缓存的旧引用。
+        let hook_ctx = if cb_ctx.hook_ctx_ptr.is_null() {
+            std::ptr::null()
+        } else {
+            cb_ctx.hook_ctx_ptr as *const crate::ffi::hook::HookContext
+        };
+        if hook_ctx.is_null() {
+            (cb_ctx.this_obj, cb_ctx.jargs_ptr, None)
+        } else {
+            let hook_ctx_ref = unsafe { &*hook_ctx };
+            let jargs = crate::jsapi::java::callback::build_jargs_from_registers(
+                hook_ctx_ref,
+                cb_ctx.param_count,
+                &cb_ctx.param_types,
+            );
+            let this_obj = if cb_ctx.is_static { 0 } else { hook_ctx_ref.x[1] };
+            let jargs_ptr = if cb_ctx.param_count > 0 {
+                jargs.as_ptr() as *const std::ffi::c_void
+            } else {
+                std::ptr::null()
+            };
+            (this_obj, jargs_ptr, Some(jargs))
+        }
     };
+
+    if cb_ctx.use_blr && cb_ctx.quick_trampoline != 0 {
+        let thread_id = crate::current_thread_id_u64();
+        let can_fast_orig = !cb_ctx.hook_ctx_ptr.is_null()
+            && crate::jsapi::java::callback::prepare_fast_orig_router_frame(
+                cb_ctx.env,
+                &*(cb_ctx.hook_ctx_ptr as *const crate::ffi::hook::HookContext),
+                cb_ctx.is_static,
+                cb_ctx.param_count,
+                &cb_ctx.param_types,
+            );
+        if can_fast_orig
+            && unsafe {
+                crate::ffi::hook::fast_orig_set(
+                    thread_id,
+                    cb_ctx.art_method,
+                    cb_ctx.quick_trampoline,
+                )
+            } == 0
+        {
+            mark_fast_orig_requested();
+            ffi::lua_pushnil(L);
+            return 1;
+        }
+    }
 
     let ret = crate::jsapi::java::callback::invoke_original_jni(
         cb_ctx.env,
         cb_ctx.art_method,
         cb_ctx.class_global_ref,
-        cb_ctx.this_obj,
+        this_obj,
         cb_ctx.return_type,
         cb_ctx.is_static,
         jargs_ptr,
         cb_ctx.quick_trampoline,
-        false,
+        cb_ctx.use_blr,
     );
 
     // 保持 jargs_buf 存活到 invoke 完成
@@ -413,14 +488,6 @@ pub(crate) unsafe fn push_jni_arg(
         b'L' | b'[' => {
             if raw == 0 {
                 ffi::lua_pushnil(L);
-            } else if !env.is_null() {
-                // 对所有对象类型自动尝试 toString
-                if let Some(s) = jni_tostring(raw, env) {
-                    let cs = std::ffi::CString::new(s).unwrap_or_default();
-                    ffi::lua_pushstring(L, cs.as_ptr());
-                } else {
-                    ffi::lua_pushlightuserdata(L, raw as *mut std::ffi::c_void);
-                }
             } else {
                 ffi::lua_pushlightuserdata(L, raw as *mut std::ffi::c_void);
             }

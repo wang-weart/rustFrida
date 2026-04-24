@@ -18,6 +18,13 @@ volatile uint64_t g_art_router_miss_count = 0;
 /* Debug: hit counter for found path */
 volatile uint64_t g_art_router_hit_count = 0;
 volatile uint64_t g_art_router_last_hit_x0 = 0;
+volatile uint64_t g_art_router_quick_hit_count = 0;
+volatile uint64_t g_art_router_quick_pass_count = 0;
+volatile uint64_t g_art_router_quick_callback_count = 0;
+volatile uint64_t g_art_router_quick_skip_count = 0;
+volatile uint64_t g_art_router_replacement_hit_count = 0;
+volatile uint64_t g_art_router_do_call_table_hit_count = 0;
+volatile uint64_t g_art_router_last_do_call_x0 = 0;
 
 /* Fast $orig bypass state */
 OrigBypassState g_orig_bypass[ORIG_BYPASS_SLOTS] = {{0}};
@@ -36,16 +43,57 @@ int hook_art_router_table_add(uint64_t original, uint64_t replacement) {
         if (g_art_router_table[i].original == original) {
             /* Already exists — update replacement */
             g_art_router_table[i].replacement = replacement;
+            g_art_router_table[i].mode = 0;
+            g_art_router_table[i].quick_callback = NULL;
+            g_art_router_table[i].quick_user_data = NULL;
             return 0;
         }
         if (g_art_router_table[i].original == 0) {
             g_art_router_table[i].original = original;
             g_art_router_table[i].replacement = replacement;
+            g_art_router_table[i].mode = 0;
+            g_art_router_table[i].quick_callback = NULL;
+            g_art_router_table[i].quick_user_data = NULL;
             return 0;
         }
     }
     hook_log("[art_router] table full (max %d)", ART_ROUTER_TABLE_MAX);
     return -1;
+}
+
+int hook_art_router_table_add_quick(uint64_t original, uint64_t replacement,
+                                    HookCallback callback, void* user_data) {
+    hook_log("[art_router] table_add_quick: original=%llx, replacement=%llx, callback=%p",
+             (unsigned long long)original, (unsigned long long)replacement, (void*)callback);
+    for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+        if (g_art_router_table[i].original == original) {
+            g_art_router_table[i].replacement = replacement;
+            g_art_router_table[i].mode = 1;
+            g_art_router_table[i].quick_callback = callback;
+            g_art_router_table[i].quick_user_data = user_data;
+            return 0;
+        }
+        if (g_art_router_table[i].original == 0) {
+            g_art_router_table[i].original = original;
+            g_art_router_table[i].replacement = replacement;
+            g_art_router_table[i].mode = 1;
+            g_art_router_table[i].quick_callback = callback;
+            g_art_router_table[i].quick_user_data = user_data;
+            return 0;
+        }
+    }
+    hook_log("[art_router] table full (max %d)", ART_ROUTER_TABLE_MAX);
+    return -1;
+}
+
+void hook_art_router_table_set_mode(uint64_t original, uint64_t mode) {
+    for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+        if (g_art_router_table[i].original == 0) break;
+        if (g_art_router_table[i].original == original) {
+            g_art_router_table[i].mode = mode;
+            return;
+        }
+    }
 }
 
 int hook_art_router_table_remove(uint64_t original) {
@@ -61,6 +109,9 @@ int hook_art_router_table_remove(uint64_t original) {
             }
             g_art_router_table[j].original = 0;
             g_art_router_table[j].replacement = 0;
+            g_art_router_table[j].mode = 0;
+            g_art_router_table[j].quick_callback = NULL;
+            g_art_router_table[j].quick_user_data = NULL;
             return 0;
         }
     }
@@ -81,6 +132,18 @@ uint64_t hook_art_router_table_lookup_original(uint64_t replacement) {
     return 0;
 }
 
+int hook_art_router_record_do_call(uint64_t method) {
+    for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+        if (g_art_router_table[i].original == 0) break;
+        if (g_art_router_table[i].original == method) {
+            __atomic_add_fetch(&g_art_router_do_call_table_hit_count, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_art_router_last_do_call_x0, method, __ATOMIC_RELAXED);
+            return g_art_router_table[i].mode ? 1 : 2;
+        }
+    }
+    return 0;
+}
+
 void hook_art_router_table_dump(void) {
     hook_log("[art_router] table dump (addr=%p):", (void*)g_art_router_table);
     for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
@@ -88,10 +151,11 @@ void hook_art_router_table_dump(void) {
             hook_log("[art_router]   [%d] <end> (total %d entries)", i, i);
             return;
         }
-        hook_log("[art_router]   [%d] original=%llx -> replacement=%llx",
+        hook_log("[art_router]   [%d] original=%llx -> replacement=%llx mode=%llx",
                  i,
                  (unsigned long long)g_art_router_table[i].original,
-                 (unsigned long long)g_art_router_table[i].replacement);
+                 (unsigned long long)g_art_router_table[i].replacement,
+                 (unsigned long long)g_art_router_table[i].mode);
     }
     hook_log("[art_router]   table full (%d entries)", ART_ROUTER_TABLE_MAX);
 }
@@ -104,8 +168,9 @@ int hook_art_router_debug_scan(uint64_t x0) {
             return 0;
         }
         if (g_art_router_table[i].original == x0) {
-            hook_log("[art_router] debug_scan: FOUND at [%d] -> replacement=%llx",
-                     i, (unsigned long long)g_art_router_table[i].replacement);
+            hook_log("[art_router] debug_scan: FOUND at [%d] -> replacement=%llx mode=%llx",
+                     i, (unsigned long long)g_art_router_table[i].replacement,
+                     (unsigned long long)g_art_router_table[i].mode);
             return 1;
         }
     }
@@ -139,6 +204,13 @@ void hook_art_router_reset_debug(void) {
     g_art_router_miss_count = 0;
     g_art_router_hit_count = 0;
     g_art_router_last_hit_x0 = 0;
+    g_art_router_quick_hit_count = 0;
+    g_art_router_quick_pass_count = 0;
+    g_art_router_quick_callback_count = 0;
+    g_art_router_quick_skip_count = 0;
+    g_art_router_replacement_hit_count = 0;
+    g_art_router_do_call_table_hit_count = 0;
+    g_art_router_last_do_call_x0 = 0;
 }
 
 void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
@@ -146,32 +218,42 @@ void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
     if (last_hit_x0)  *last_hit_x0  = g_art_router_last_hit_x0;
 }
 
+void hook_art_router_get_route_stats(uint64_t* quick_hits,
+                                     uint64_t* replacement_hits,
+                                     uint64_t* do_call_table_hits,
+                                     uint64_t* last_do_call_x0,
+                                     uint64_t* quick_pass_hits,
+                                     uint64_t* quick_callback_calls,
+                                     uint64_t* quick_skip_hits) {
+    if (quick_hits)          *quick_hits          = g_art_router_quick_hit_count;
+    if (replacement_hits)    *replacement_hits    = g_art_router_replacement_hit_count;
+    if (do_call_table_hits)  *do_call_table_hits  = g_art_router_do_call_table_hit_count;
+    if (last_do_call_x0)     *last_do_call_x0     = g_art_router_last_do_call_x0;
+    if (quick_pass_hits)     *quick_pass_hits     = g_art_router_quick_pass_count;
+    if (quick_callback_calls)*quick_callback_calls= g_art_router_quick_callback_count;
+    if (quick_skip_hits)     *quick_skip_hits     = g_art_router_quick_skip_count;
+}
+
 /* ============================================================================
  * ART router thunk helpers — shared code blocks for generate_art_router_thunk
  * and hook_create_art_router_stub.
  * ============================================================================ */
 
-/* 对标 Frida ARM64 trampoline: 保存全部 FPR + GPR + x0
- * 总栈帧: FPR(64) + GPR(144) + x0(16) = 224 bytes
- * Save order (Frida android.js:3425-3444):
- *   d0-d7 (FP regs, 64 bytes)
- *   x1-x7, x20-x28, x29, lr (GPR 18 regs = 144 bytes)
- *   x0 (ArtMethod*, 16 bytes aligned)
+/* ART-visible router frame. Keep this identical in size to ARM64
+ * SaveRefsAndArgs (224 bytes): even if our fake OAT header is missed, ART's
+ * native GenericJNI fallback advances by the same frame size instead of reading
+ * saved registers as the next ArtMethod.
+ *
+ * Full callback HookContext lives in TLS; this stack frame is only the managed
+ * stack-walk frame plus the raw quick-call registers needed to rebuild context.
  */
-#define ROUTER_FRAME_FP_OFF  160  /* GPR(144) + x0(16) */
-#define ROUTER_FRAME_GPR_OFF  16  /* x0(16) */
-#define ROUTER_FRAME_SIZE    224  /* 64 + 144 + 16 */
-
-/* Return PC offset within 224-byte frame = 224 - 8 = 216.
- * ART StackVisitor::GetReturnPcAddr = SP + frame_size - 8.
- * 我们在 prologue 尾部 STR LR, [SP, #216] 让 GC WalkStack 读到正确 caller LR. */
+#define ROUTER_FRAME_SIZE          224
+#define ROUTER_FRAME_PADDING_OFF   8
+#define ROUTER_FRAME_FP_OFF        16
+#define ROUTER_X1_OFF              80
+#define ROUTER_SAVED_X20_OFF       136
+#define ROUTER_SAVED_X30_OFF       216
 #define ROUTER_FRAME_RETURN_PC_OFF 216
-
-/* Named offsets for specific saved registers within the router frame.
- * x20 is the second reg in STP x7,x20 at GPR_OFF+48 → offset 72.
- * LR  is the second reg in STP x29,lr at GPR_OFF+128 → offset 152. */
-#define ROUTER_SAVED_X20_OFF (ROUTER_FRAME_GPR_OFF + 48 + 8)   /* 72 */
-#define ROUTER_SAVED_LR_OFF  (ROUTER_FRAME_GPR_OFF + 128 + 8)  /* 152 */
 
 /* TPIDR_EL0 system register encoding */
 #define SYSREG_TPIDR_EL0 0xDE82
@@ -242,13 +324,62 @@ void orig_bypass_clear(uint64_t thread) {
 
 FastOrigSlot g_fast_orig_slots[FAST_ORIG_SLOTS] = {{0}};
 volatile uint64_t g_fast_orig_active = 0;
+volatile uint64_t g_fast_orig_frame_thread = 0;
+volatile uint64_t g_fast_orig_frame_sp = 0;
 
-int fast_orig_set(uint64_t thread) {
+static __thread HookContext g_art_router_tls_ctx;
+
+static HookContext* art_router_prepare_quick_context(void* frame_sp) {
+    uint8_t* sp = (uint8_t*)frame_sp;
+    HookContext* ctx = &g_art_router_tls_ctx;
+    uint64_t thread = 0;
+#if defined(__aarch64__)
+    __asm__ __volatile__("mov %0, x19" : "=r"(thread));
+#endif
+    ctx->x[0] = *(uint64_t*)(sp + 0);
+    for (int i = 1; i <= 7; i++) {
+        ctx->x[i] = *(uint64_t*)(sp + ROUTER_X1_OFF + (i - 1) * 8);
+    }
+    for (int i = 8; i < 31; i++) {
+        ctx->x[i] = 0;
+    }
+    ctx->x[19] = thread;
+    for (int i = 20; i <= 29; i++) {
+        ctx->x[i] = *(uint64_t*)(sp + ROUTER_SAVED_X20_OFF + (i - 20) * 8);
+    }
+    ctx->x[30] = *(uint64_t*)(sp + ROUTER_SAVED_X30_OFF);
+    ctx->sp = (uint64_t)(sp + ROUTER_FRAME_SIZE);
+    ctx->pc = 0;
+    ctx->nzcv = 0;
+    ctx->trampoline = NULL;
+    for (int i = 0; i < 8; i++) {
+        ctx->d[i] = *(uint64_t*)(sp + ROUTER_FRAME_FP_OFF + i * 8);
+    }
+    ctx->intercept_leave = 0;
+    return ctx;
+}
+
+static HookContext* art_router_prepare_quick_context_preorig(void* frame_sp,
+                                                             uint64_t ret_x0,
+                                                             double ret_d0) {
+    HookContext* ctx = art_router_prepare_quick_context(frame_sp);
+    uint64_t ret_d0_bits = 0;
+    memcpy(&ret_d0_bits, &ret_d0, sizeof(ret_d0_bits));
+    ctx->x[16] = ret_x0;
+    ctx->d[0] = ret_d0_bits;
+    return ctx;
+}
+
+int fast_orig_set(uint64_t thread, uint64_t method, uint64_t trampoline) {
     for (int i = 0; i < FAST_ORIG_SLOTS; i++) {
         FastOrigSlot* slot = &g_fast_orig_slots[i];
         uint64_t expected = 0;
-        if (__atomic_compare_exchange_n(&slot->thread, &expected, thread,
-                                         0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        if (__atomic_compare_exchange_n(&slot->thread, &expected, (uint64_t)1,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            slot->method = method;
+            slot->trampoline = trampoline;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            slot->thread = thread;
             __atomic_add_fetch(&g_fast_orig_active, 1, __ATOMIC_RELEASE);
             return 0;
         }
@@ -267,28 +398,54 @@ void fast_orig_clear(uint64_t thread) {
     }
 }
 
+uint64_t fast_orig_current_frame(uint64_t thread) {
+    if (__atomic_load_n(&g_fast_orig_frame_thread, __ATOMIC_ACQUIRE) == thread) {
+        return __atomic_load_n(&g_fast_orig_frame_sp, __ATOMIC_ACQUIRE);
+    }
+    return 0;
+}
+
+static void emit_set_fast_orig_frame(Arm64Writer* w) {
+    arm64_writer_put_mrs_reg(w, ARM64_REG_X16, SYSREG_TPIDR_EL0);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_fast_orig_frame_sp);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_SP, ARM64_REG_X17, 0);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_fast_orig_frame_thread);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+}
+
+static void emit_clear_fast_orig_frame(Arm64Writer* w) {
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_fast_orig_frame_thread);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X17, 0);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_fast_orig_frame_sp);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X17, 0);
+}
+
 static void emit_art_router_prologue(Arm64Writer* w) {
     /* thunk-level 计数废弃, 见 hook_engine_inline.c emit_save_hook_context 注释.
      * 计数改为只在 Rust java_hook_callback 进出点 inc/dec. */
     /* 分配整个帧 */
     arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
-    /* FPR: d0-d7 at SP+160 */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_SP, ROUTER_FRAME_PADDING_OFF);
+
+    /* Match ART ARM64 SaveRefsAndArgs exactly:
+     *   +16..+72  d0-d7
+     *   +80..+128 x1-x7
+     *   +136..+216 x20-x29, lr
+     */
     for (int i = 0; i < 8; i += 2) {
         arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF + i * 8);
     }
-    /* GPR at SP+16: x1,x2 / x3,x4 / x5,x6 / x7,x20 / x21,x22 / x23,x24 / x25,x26 / x27,x28 / x29,lr */
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X1,  ARM64_REG_X2,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 0,   ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X3,  ARM64_REG_X4,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 16,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X5,  ARM64_REG_X6,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 32,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X7,  ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 48,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 64,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 80,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 96,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 112, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 128, ARM64_INDEX_SIGNED_OFFSET);
-    /* x0 at SP+0 */
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
-    /* WalkStack 根治: 在 frame 尾部 (SP + frame_size - 8 = SP + 216) 也存一份 caller LR.
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_X20, ARM64_REG_SP, 128, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 144, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 160, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 176, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 192, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_X30, ARM64_REG_SP, 208, ARM64_INDEX_SIGNED_OFFSET);
+    /* WalkStack 根治: 在 frame 尾部 (SP + frame_size - 8) 也存一份 caller LR.
      * 这是伪 OatQuickMethodHeader 的 GetReturnPcOffset(). ART StackVisitor::WalkStack
      * advance 到下一帧时, next_pc = *(SP + frame_size - 8). 如不写, GC 在此位置读到
      * 未初始化字节 → 把垃圾 PC 交给下一帧的 GetOatQuickMethodHeader → wild branch SEGV. */
@@ -311,7 +468,7 @@ static void emit_art_router_scan_loop(Arm64Writer* w,
     arm64_writer_put_cbz_reg_label(w, ARM64_REG_X17, lbl_not_found);
     arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X0);
     arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_found);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 16);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, sizeof(ArtRouterEntry));
     arm64_writer_put_b_label(w, lbl_loop);
 
     *lbl_found_out = lbl_found;
@@ -320,22 +477,19 @@ static void emit_art_router_scan_loop(Arm64Writer* w,
 
 /* 对标 Frida: 恢复全部寄存器 (prologue 的逆序，使用固定偏移) */
 static void emit_art_router_restore_all(Arm64Writer* w) {
-    /* x0 at SP+0 */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
-    /* GPR at SP+16 */
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1,  ARM64_REG_X2,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 0,   ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3,  ARM64_REG_X4,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 16,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5,  ARM64_REG_X6,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 32,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X7,  ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 48,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 64,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 80,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 96,  ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 112, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 128, ARM64_INDEX_SIGNED_OFFSET);
-    /* FPR at SP+160 */
     for (int i = 0; i < 8; i += 2) {
         arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF + i * 8);
     }
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_X20, ARM64_REG_SP, 128, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 144, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 160, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 176, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 192, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_X30, ARM64_REG_SP, 208, ARM64_INDEX_SIGNED_OFFSET);
     /* 释放帧 */
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
     /* thunk-level dec 废弃 (见 prologue 注释) */
@@ -351,6 +505,13 @@ static void emit_art_router_debug_counters(Arm64Writer* w) {
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
 }
 
+static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* counter) {
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)counter);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_X0, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+}
+
 /* Found path: load replacement ArtMethod from table[i].replacement,
  * overwrite saved X0 with replacement, restore all regs, then jump to
  * replacement.entry_point_ (jni_trampoline).
@@ -363,19 +524,137 @@ static void emit_art_router_debug_counters(Arm64Writer* w) {
  * Returns 1 = normal routing, 0 = skip (callOriginal recursion). */
 extern int art_router_stack_check(uint64_t replacement);
 
+static void emit_restore_args_only(Arm64Writer* w);
+
+static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_quick,
+                                                 uint64_t lbl_not_found,
+                                                 uint64_t trampoline_target) {
+    uint64_t lbl_quick_continue = arm64_writer_new_label_id(w);
+    uint64_t lbl_call_original = arm64_writer_new_label_id(w);
+    uint64_t lbl_return_replacement = arm64_writer_new_label_id(w);
+    uint64_t lbl_preorig_callback = arm64_writer_new_label_id(w);
+
+    arm64_writer_put_label(w, lbl_quick);
+
+    emit_art_router_inc_counter(w, &g_art_router_quick_hit_count);
+
+    /* X16 points to matched table entry. Load the native replacement sentinel
+     * and publish it at SP+0 while the callback runs so ART StackVisitor treats
+     * this router frame as native and does not look for StackMap data for the
+     * original method at our generated PC. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+
+    /* Reuse the existing recursion guard. If this thread is inside $orig,
+     * restore original x0 and fall through to the relocated original code. */
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X20, ARM64_REG_X16);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X21, ARM64_REG_X17);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X17);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)art_router_stack_check);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_quick_continue);
+    emit_art_router_inc_counter(w, &g_art_router_quick_skip_count);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    arm64_writer_put_b_label(w, lbl_not_found);
+
+    arm64_writer_put_label(w, lbl_quick_continue);
+    emit_art_router_inc_counter(w, &g_art_router_quick_pass_count);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X20);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X21);
+
+    /* Mode 2: call original first inside the router frame, then run the
+     * callback. Lua self:orig() reads the saved return value instead of
+     * crossing JNI or calling quick code from a native callback stack. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 16);
+    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X1, 2);
+    arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X0, ARM64_REG_X1);
+    arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_preorig_callback);
+
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X20, 24); /* quick_callback */
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X16, lbl_call_original);
+    emit_art_router_inc_counter(w, &g_art_router_quick_callback_count);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_SP);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)art_router_prepare_quick_context);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X17);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X22, ARM64_REG_X0);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X20, 32); /* quick_user_data */
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, 344);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_return_replacement);
+
+    arm64_writer_put_label(w, lbl_call_original);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    emit_art_router_restore_all(w);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_target);
+    arm64_writer_put_br_reg(w, ARM64_REG_X16);
+
+    arm64_writer_put_label(w, lbl_preorig_callback);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X20, 24); /* quick_callback */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X24, ARM64_REG_X20, 32); /* quick_user_data */
+
+    /* Keep SP+0 as the quick stack sentinel while the original runs.
+     * The sentinel is a static native no-object-argument ArtMethod clone whose
+     * quick entrypoint points at this generated thunk, so StackVisitor can use
+     * our fake header for wwb_hook_pool PCs and ReferenceMapVisitor has no
+     * object parameters to scan from the synthetic router frame. */
+    emit_restore_args_only(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 8);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_target);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X1, ARM64_REG_X0);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_SP);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)art_router_prepare_quick_context_preorig);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X17);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X22, ARM64_REG_X0);
+
+    uint64_t lbl_preorig_no_callback = arm64_writer_new_label_id(w);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X23);
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X16, lbl_preorig_no_callback);
+    emit_art_router_inc_counter(w, &g_art_router_quick_callback_count);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X22);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X1, ARM64_REG_X24);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    arm64_writer_put_b_label(w, lbl_return_replacement);
+
+    arm64_writer_put_label(w, lbl_preorig_no_callback);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, 128);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, 0);
+    arm64_writer_put_b_label(w, lbl_return_replacement);
+
+    arm64_writer_put_label(w, lbl_return_replacement);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_fp_ldp_offset(w, 0, 1, ARM64_REG_X22, 280);
+    arm64_writer_put_fp_stp_offset(w, 0, 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF);
+    emit_art_router_restore_all(w);
+    arm64_writer_put_ret(w);
+}
+
 static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
                                         uint32_t quickcode_offset,
                                         uint64_t current_pc_hint,
-                                        uint64_t lbl_not_found) {
+                                        uint64_t lbl_not_found,
+                                        uint64_t trampoline_target) {
     (void)current_pc_hint;
 
     arm64_writer_put_label(w, lbl_found);
 
     /* Debug: increment hit counter */
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_hit_count);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_X0, 1);
+    emit_art_router_inc_counter(w, &g_art_router_hit_count);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_last_hit_x0);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 0);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+
+    uint64_t lbl_quick = arm64_writer_new_label_id(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 16);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_quick);
+
+    emit_art_router_inc_counter(w, &g_art_router_replacement_hit_count);
 
     /* X16 points to matched table entry; load replacement ArtMethod* from offset 8 */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
@@ -423,6 +702,8 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     /* Load replacement.entry_point_ (= jni_trampoline) 到 x16, BR 出 thunk */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X0, quickcode_offset);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
+
+    emit_art_router_quick_callback_path(w, lbl_quick, lbl_not_found, trampoline_target);
 }
 
 /* Not-found path: 对标 Frida — 恢复全部寄存器 → relocated original instructions → jump back.
@@ -442,40 +723,27 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
  * BLR variant helpers
  * ============================================================================ */
 
-/* Restore only argument regs (x0-x7, d0-d7) from frame. No callee-saved, no frame pop. */
+/* Restore quick argument regs from the ART-visible router frame. */
 static void emit_restore_args_only(Arm64Writer* w) {
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 0, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 16, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 32, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 48);
     for (int i = 0; i < 8; i += 2) {
         arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP,
             ROUTER_FRAME_FP_OFF + i * 8);
     }
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP, 128);
 }
 
-/* Restore callee-saved regs (x20-x28, x29, LR) from frame + pop frame.
+/* Restore callee-saved regs (x20-x29, LR) from frame + pop frame.
  * Clobbers NO scratch regs (x16/x17 untouched). */
 static void emit_restore_callee_and_pop(Arm64Writer* w) {
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP,
-        ROUTER_SAVED_X20_OFF);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 64, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 80, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 96, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 112, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 128);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_LR, ARM64_REG_SP,
-        ROUTER_SAVED_LR_OFF);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP, 136);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, 144, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, 160, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, 176, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, 192, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR, ARM64_REG_SP, 208, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
 }
 
@@ -487,7 +755,9 @@ static void emit_restore_callee_and_pop(Arm64Writer* w) {
  *   - If no: return callback value to caller
  *
  * trampoline_target: relocated original instructions (known at thunk generation time).
- * Stored in callee-saved X22 to survive the BLR. */
+ * Stored in the router frame to survive ART quick/JNI trampolines. Do not rely
+ * on x20/x22 being preserved across the BLR: ART quick stubs are not ordinary
+ * C callees for our purposes. */
 static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
                                             uint32_t quickcode_offset,
                                             uint64_t lbl_not_found,
@@ -495,9 +765,10 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_label(w, lbl_found);
 
     /* Debug: increment hit counter */
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_hit_count);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_X0, 1);
+    emit_art_router_inc_counter(w, &g_art_router_hit_count);
+    emit_art_router_inc_counter(w, &g_art_router_replacement_hit_count);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_last_hit_x0);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 0);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
 
     /* Load replacement ArtMethod* from table entry offset 8 */
@@ -526,10 +797,7 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X0, 0);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X17, 0);
 
-    /* === BLR-specific: prepare callee-saved state for post-callback === */
-
-    /* X22 = trampoline (survives BLR via callee-saved) */
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X22, trampoline_target);
+    /* === BLR-specific: prepare frame state for post-callback === */
 
     /* Load replacement.entry_point_ */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, quickcode_offset);
@@ -537,13 +805,16 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     /* Restore argument regs from frame (don't pop, don't restore callee-saved) */
     emit_restore_args_only(w);
 
+    /* Expose the router frame to Rust while the replacement callback is active.
+     * If callback requests fast orig, Rust patches object slots in this frame
+     * from live JNI transition refs before returning to this post-callback code. */
+    emit_set_fast_orig_frame(w);
+
     /* BLR: call replacement, frame stays on stack */
     arm64_writer_put_blr_reg(w, ARM64_REG_X16);
 
     /* === Post-callback: check fast $orig flag ===
      * x0 = callback return value (from JNI)
-     * X20 = table entry ptr (callee-saved, preserved by BLR target)
-     * X22 = trampoline_target (callee-saved, preserved)
      * SP → art_router frame (intact, never popped) */
 
     uint64_t lbl_no_orig = arm64_writer_new_label_id(w);
@@ -568,6 +839,8 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     /* === do_orig: restore original Quick regs, BR trampoline === */
     arm64_writer_put_label(w, lbl_do_orig);
 
+    emit_clear_fast_orig_frame(w);
+
     /* Clear matched slot: scan and zero (X16 = current TPIDR_EL0) */
     for (int i = 0; i < FAST_ORIG_SLOTS; i++) {
         FastOrigSlot* slot = &g_fast_orig_slots[i];
@@ -577,6 +850,8 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
         arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X16, ARM64_REG_X0);
         arm64_writer_put_b_cond_label(w, ARM64_COND_NE, lbl_skip);
         arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X17, 0);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_X17, 8);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X17, 16);
         arm64_writer_put_label(w, lbl_skip);
     }
     /* Decrement active */
@@ -591,25 +866,9 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 1);
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
 
-    /* Restore original Quick regs:
-     * x0 = original ArtMethod* (from table entry via X20)
-     * x1-x7, d0-d7 from frame (original caller's args) */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 0, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 16, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 32, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP,
-        ROUTER_FRAME_GPR_OFF + 48);
-    for (int i = 0; i < 8; i += 2) {
-        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP,
-            ROUTER_FRAME_FP_OFF + i * 8);
-    }
-
-    /* Save trampoline to X16 BEFORE restoring callee-saved (which overwrites X22) */
-    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X22);
+    emit_restore_args_only(w);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X20);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X21);
 
     /* Restore callee-saved + pop frame */
     emit_restore_callee_and_pop(w);
@@ -622,6 +881,8 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
 
     /* Save callback return value (x0) to X16 */
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X0);
+
+    emit_clear_fast_orig_frame(w);
 
     /* Restore callee-saved + pop frame */
     emit_restore_callee_and_pop(w);
@@ -655,83 +916,94 @@ static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
  *   4. thunk 一开头就把 replacement (native ArtMethod*) 写到 SP+0
  *      → WalkStack 读 *SP = replacement → IsNative=true → ToDexPc 走 native 早退路径
  *
- * CodeInfo 最小编码 (7 个 interleaved varints, 4 bits each):
- *   [flags=0, code_size=15(next 32 bits), frame=0, core=0, fp=0, dex_regs=0, bit_flags=0]
- *   = 28 bits nibbles + 32 bits code_size = 60 bits = 8 bytes (4 trailing bits=0)
- *
- * 总前缀 12 字节: 8B CodeInfo + 4B OatQuickMethodHeader
+ * The fake CodeInfo must describe the same callee-save layout as ART ARM64
+ * SaveRefsAndArgs. If the spill masks are zero, StackVisitor advances by the
+ * right frame size but does not refill caller context registers, so the next
+ * compiled Java frame can treat stale scalar registers (for example 0x1) as
+ * object roots during GC.
  * ============================================================================ */
 
-#define FAKE_OAT_PREFIX_SIZE 12  /* 8B CodeInfo + 4B header */
-#define FAKE_OAT_CODEINFO_BYTES 8
+#define FAKE_OAT_CODEINFO_BYTES 16
+#define FAKE_OAT_PREFIX_SIZE (FAKE_OAT_CODEINFO_BYTES + 4)
 
-/* router thunk 实际 frame_size (SUB SP, #0xE0 → 224) / kStackAlignment (16) = 14 */
+/* router thunk frame_size (SUB SP, #0xE0 -> 224) / kStackAlignment (16) = 14 */
 #define FAKE_PACKED_FRAME_SIZE 14
+#define FAKE_CORE_SPILL_MASK \
+    ((1u << 30) | \
+     (1u << 29) | (1u << 28) | (1u << 27) | (1u << 26) | (1u << 25) | \
+     (1u << 24) | (1u << 23) | (1u << 22) | (1u << 21) | (1u << 20) | \
+     (1u << 7)  | (1u << 6)  | (1u << 5)  | (1u << 4)  | (1u << 3)  | \
+     (1u << 2)  | (1u << 1))
+#define FAKE_FP_SPILL_MASK 0xffu
+
+static void fake_codeinfo_write_bits(uint8_t* buf, size_t* bit_offset,
+                                     uint32_t value, size_t bit_count) {
+    for (size_t i = 0; i < bit_count; i++) {
+        if ((value >> i) & 1u) {
+            size_t bit = *bit_offset + i;
+            buf[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+        }
+    }
+    *bit_offset += bit_count;
+}
+
+static void fake_codeinfo_write_interleaved_varints(uint8_t* buf,
+                                                    const uint32_t values[7],
+                                                    const uint8_t widths[7]) {
+    size_t bit_offset = 0;
+    for (int i = 0; i < 7; i++) {
+        uint32_t value = values[i];
+        uint32_t marker = value <= 11u ? value : (11u + widths[i]);
+        fake_codeinfo_write_bits(buf, &bit_offset, marker, 4);
+    }
+    for (int i = 0; i < 7; i++) {
+        if (values[i] > 11u) {
+            fake_codeinfo_write_bits(buf, &bit_offset, values[i], (size_t)widths[i] * 8u);
+        }
+    }
+}
 
 /* CodeInfo 编码: 7 个 interleaved 4-bit varint + 追加 32-bit 值 (当 nibble >= 12).
- * 需要 code_size_ 和 packed_frame_size_ 都 > 11 (long format), 其他 5 字段 = 0.
- * 布局 (LSB-first within byte):
- *   bit 0..3   = flags_ = 0
- *   bit 4..7   = code_size marker = 15 (next 32 bits hold value)
- *   bit 8..11  = packed_frame_size marker = 15 (next 32 bits)
- *   bit 12..15 = core_spill_mask_ = 0
- *   bit 16..19 = fp_spill_mask_ = 0
- *   bit 20..23 = number_of_dex_registers_ = 0
- *   bit 24..27 = bit_table_flags_ = 0
- *   bit 28..31 = pad = 0 (next 32 bits align to byte boundary)
- *   bit 32..63 = code_size_ value (32 bits LE-bit)
- *   bit 64..95 = packed_frame_size_ value (32 bits)
- * 共 12 bytes. */
+ * 字段顺序与 art::CodeInfo::ForEachHeaderField 一致:
+ *   flags, code_size, packed_frame_size, core_spill_mask, fp_spill_mask,
+ *   number_of_dex_registers, bit_table_flags.
+ */
 static void encode_fake_codeinfo_v2(uint8_t buf[FAKE_OAT_CODEINFO_BYTES],
                                      uint32_t code_size, uint32_t frame_packed) {
     memset(buf, 0, FAKE_OAT_CODEINFO_BYTES);
-    /* ART bit-stream, LSB-first within each byte, bytes LE in memory.
-     *
-     * Phase A (28 nibble bits = 7 * 4):
-     *   bit  0..3  : nibble0 = flags             = 0
-     *   bit  4..7  : nibble1 = code_size marker  = 15 (0xF)  → 下面跟 32 bits 值
-     *   bit  8..11 : nibble2 = frame_size marker = 15 (0xF)  → 再跟 32 bits 值
-     *   bit 12..15 : nibble3 = core_spill_mask   = 0
-     *   bit 16..19 : nibble4 = fp_spill_mask     = 0
-     *   bit 20..23 : nibble5 = num_dex_registers = 0
-     *   bit 24..27 : nibble6 = bit_table_flags   = 0
-     *
-     * Phase B (code_size 32 bits starting at bit 28):
-     *   bit 28..31 = byte 3 high nibble = code_size bits 0..3
-     *   bit 32..39 = byte 4             = code_size bits 4..11
-     *   bit 40..47 = byte 5             = code_size bits 12..19
-     *   bit 48..55 = byte 6             = code_size bits 20..27
-     *   bit 56..59 = byte 7 low nibble  = code_size bits 28..31
-     *
-     * Phase C (frame_packed 32 bits starting at bit 60):
-     *   bit 60..63 = byte 7 high nibble = frame_size bits 0..3
-     *   bit 64..71 = byte 8             = frame_size bits 4..11
-     *   bit 72..79 = byte 9             = frame_size bits 12..19
-     *   bit 80..87 = byte 10            = frame_size bits 20..27
-     *   bit 88..91 = byte 11 low nibble = frame_size bits 28..31
-     *   bit 92..95 = byte 11 high nibble = pad = 0
-     */
-    buf[0] = 0xF0;  /* nibble0=0 (low), nibble1=15 (high) */
-    buf[1] = 0x0F;  /* nibble2=15 (low), nibble3=0 (high) */
-    buf[2] = 0x00;  /* nibble4=0, nibble5=0 */
-    buf[3] = (uint8_t)((code_size & 0x0F) << 4);  /* nibble6=0 (low) | code_size bits 0..3 (high) */
-    buf[4] = (uint8_t)((code_size >> 4)  & 0xFF);
-    buf[5] = (uint8_t)((code_size >> 12) & 0xFF);
-    buf[6] = (uint8_t)((code_size >> 20) & 0xFF);
-    buf[7] = (uint8_t)(((code_size >> 28) & 0x0F) | ((frame_packed & 0x0F) << 4));
-    buf[8] = (uint8_t)((frame_packed >> 4)  & 0xFF);
-    buf[9] = (uint8_t)((frame_packed >> 12) & 0xFF);
-    buf[10]= (uint8_t)((frame_packed >> 20) & 0xFF);
-    buf[11]= (uint8_t)((frame_packed >> 28) & 0x0F);
+    uint32_t values[7] = {
+        0,
+        code_size,
+        frame_packed,
+        FAKE_CORE_SPILL_MASK,
+        FAKE_FP_SPILL_MASK,
+        0,
+        0,
+    };
+    uint8_t widths[7] = {
+        0,
+        4, /* code_size */
+        1, /* packed_frame_size = 14 */
+        4, /* core_spill_mask */
+        1, /* fp_spill_mask = 0xff */
+        0,
+        0,
+    };
+    fake_codeinfo_write_interleaved_varints(buf, values, widths);
 }
 
-/* 填充 thunk 前 16 字节: [CodeInfo 12B][OatQuickMethodHeader 4B]. */
-static void backfill_fake_oat_header(void* thunk_mem, uint32_t body_size) {
+/* 填充 thunk 前 16 字节: [CodeInfo 12B][OatQuickMethodHeader 4B].
+ * code_size covers the whole executable body allocation, not just the current
+ * writer offset. If ART fails Contains(pc) for a router return PC, native
+ * sentinel frames fall back to GenericJNI frame size. The router frame is kept
+ * at the same 224-byte size so both paths advance identically. */
+static void backfill_fake_oat_header(void* thunk_mem, uint32_t code_size) {
     uint8_t* p = (uint8_t*)thunk_mem;
-    encode_fake_codeinfo_v2(p, body_size, FAKE_PACKED_FRAME_SIZE);
-    /* code_info_offset_ = 距 code_ 向前的字节数 = 12 (CodeInfo 紧挨着 header) */
-    uint32_t code_info_offset = FAKE_OAT_CODEINFO_BYTES;
-    memcpy(p + FAKE_OAT_CODEINFO_BYTES, &code_info_offset, sizeof(uint32_t));
+    encode_fake_codeinfo_v2(p, code_size, FAKE_PACKED_FRAME_SIZE);
+    /* code_info_offset_ is measured from code_ (body start) back to CodeInfo,
+     * so it includes both the CodeInfo bytes and the 4-byte header. */
+    uint32_t header_data = FAKE_OAT_PREFIX_SIZE;
+    memcpy(p + FAKE_OAT_CODEINFO_BYTES, &header_data, sizeof(uint32_t));
 }
 
 /* ============================================================================
@@ -777,7 +1049,8 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
         emit_art_router_found_path_blr(&w, lbl_found, quickcode_offset, lbl_not_found,
                                         (uint64_t)trampoline_target);
     } else {
-        emit_art_router_found_path(&w, lbl_found, quickcode_offset, current_pc_hint, lbl_not_found);
+        emit_art_router_found_path(&w, lbl_found, quickcode_offset, current_pc_hint,
+                                   lbl_not_found, (uint64_t)trampoline_target);
     }
 
     /* === not_found path: fall through to trampoline === */
@@ -787,11 +1060,11 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
     size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
-    hook_log("[art_router] thunk body_size=%zu (alloc=%zu, use_blr=%d)",
-             body_size, thunk_alloc, use_blr);
+    hook_log("[art_router] thunk body_size=%zu body_alloc=%zu (alloc=%zu, use_blr=%d)",
+             body_size, body_alloc, thunk_alloc, use_blr);
 
-    /* 回填伪 OAT header + CodeInfo (Contains(pc) 覆盖整个 thunk body) */
-    backfill_fake_oat_header(thunk_mem, (uint32_t)body_size);
+    /* 回填伪 OAT header + CodeInfo (Contains(pc) 覆盖整个 thunk body allocation) */
+    backfill_fake_oat_header(thunk_mem, (uint32_t)body_alloc);
 
     /* 返回总字节数 (含 12B 前缀), 调用方用于 hook_flush_cache */
     return FAKE_OAT_PREFIX_SIZE + body_size;
@@ -950,6 +1223,21 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     return trampoline;
 }
 
+void* hook_art_router_get_thunk_body(void* target) {
+    if (!g_engine.initialized || !target) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_engine.lock);
+    HookEntry* entry = find_hook(target);
+    void* body = NULL;
+    if (entry && entry->thunk) {
+        body = (uint8_t*)entry->thunk + FAKE_OAT_PREFIX_SIZE;
+    }
+    pthread_mutex_unlock(&g_engine.lock);
+    return body;
+}
+
 /* ============================================================================
  * hook_create_art_router_stub — standalone ART router (no inline patching)
  *
@@ -990,7 +1278,8 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     uint64_t lbl_found, lbl_not_found;
     emit_art_router_scan_loop(&w, &lbl_found, &lbl_not_found);
-    emit_art_router_found_path(&w, lbl_found, quickcode_offset, 0, lbl_not_found);
+    emit_art_router_found_path(&w, lbl_found, quickcode_offset, 0,
+                               lbl_not_found, fallback_target);
 
     /* === not_found path: jump to fallback === */
     emit_art_router_not_found_path(&w, lbl_not_found, fallback_target);
@@ -999,8 +1288,8 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
-    /* 回填 12B 伪 OAT header + CodeInfo */
-    backfill_fake_oat_header(stub_mem, (uint32_t)body_size);
+    /* 回填 16B 伪 OAT header + CodeInfo */
+    backfill_fake_oat_header(stub_mem, (uint32_t)body_alloc);
 
     hook_flush_cache(stub_mem, FAKE_OAT_PREFIX_SIZE + body_size);
 

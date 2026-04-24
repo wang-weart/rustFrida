@@ -517,7 +517,8 @@ pub(super) fn ensure_art_controller_initialized(
             }
             let (ha, sf) = unsafe { prepare_hook_target(addr, std::ptr::null_mut()) }.unwrap_or((addr, 0));
             let ret = unsafe {
-                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, std::ptr::null_mut(), sf)
+                let is_range = (i & 1) as usize as *mut std::ffi::c_void;
+                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, is_range, sf)
             };
             if ret == 0 {
                 unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
@@ -651,9 +652,12 @@ pub(super) fn ensure_art_controller_initialized(
         }
     }
 
-    // --- Fix: hook PrettyMethod (NULL 指针崩溃防护) ---
+    // PrettyMethod can run from ART/JD crash and signal paths. Routing it
+    // through our hook pool can leave a thread unsuspendable if a signal handler
+    // blocks there, so keep this guard disabled and rely on the OAT-header and
+    // SIGSEGV walkstack guards below.
     let mut pretty_method_hook_target: u64 = 0;
-    if bridge.pretty_method != 0 {
+    if false && bridge.pretty_method != 0 {
         let (ha, sf) = unsafe { prepare_hook_target(bridge.pretty_method, std::ptr::null_mut()) }.unwrap_or((bridge.pretty_method, 0));
         let ret = unsafe {
             hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_pretty_method_enter), None, std::ptr::null_mut(), sf)
@@ -722,6 +726,12 @@ fn get_art_thread_spec_cached() -> Option<&'static ArtThreadSpec> {
     }
 }
 
+pub(crate) fn cached_thread_top_quick_frame_offset() -> Option<usize> {
+    let thread_spec = get_art_thread_spec_cached()?;
+    let ms_spec = get_managed_stack_spec();
+    Some(thread_spec.managed_stack_offset + ms_spec.top_quick_frame_offset)
+}
+
 /// Callback gate: 只允许一个线程进入完整 JNI trampoline → callback 路径。
 /// 在 art_router_stack_check 中 CAS 获取，在 java_hook_callback 末尾（guard drop）释放。
 pub(crate) static JAVA_CALLBACK_GATE: std::sync::atomic::AtomicBool =
@@ -729,7 +739,72 @@ pub(crate) static JAVA_CALLBACK_GATE: std::sync::atomic::AtomicBool =
 
 /// Gate 冷却计数器：释放后 N 次调用全部 bypass，避免主线程频繁走 $orig JNI 路径
 static GATE_COOLDOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static GATE_COOLDOWN_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(50);
+static GATE_COOLDOWN_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+const HOT_METHOD_SAMPLER_SLOTS: usize = 16;
+static HOT_METHOD_SAMPLER_ORIGINALS: [std::sync::atomic::AtomicU64; HOT_METHOD_SAMPLER_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; HOT_METHOD_SAMPLER_SLOTS];
+static HOT_METHOD_SAMPLER_EVERY_N: [std::sync::atomic::AtomicU32; HOT_METHOD_SAMPLER_SLOTS] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; HOT_METHOD_SAMPLER_SLOTS];
+static HOT_METHOD_SAMPLER_COUNTERS: [std::sync::atomic::AtomicU64; HOT_METHOD_SAMPLER_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; HOT_METHOD_SAMPLER_SLOTS];
+
+pub(crate) fn register_hot_method_sampler(original: u64, every_n: u32) {
+    if original == 0 || every_n <= 1 {
+        return;
+    }
+    for i in 0..HOT_METHOD_SAMPLER_SLOTS {
+        let existing = HOT_METHOD_SAMPLER_ORIGINALS[i].load(std::sync::atomic::Ordering::Acquire);
+        if existing == original {
+            HOT_METHOD_SAMPLER_EVERY_N[i].store(every_n, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        if existing == 0
+            && HOT_METHOD_SAMPLER_ORIGINALS[i]
+                .compare_exchange(
+                    0,
+                    original,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            HOT_METHOD_SAMPLER_EVERY_N[i].store(every_n, std::sync::atomic::Ordering::Release);
+            HOT_METHOD_SAMPLER_COUNTERS[i].store(0, std::sync::atomic::Ordering::Release);
+            output_verbose(&format!(
+                "[hot-sampler] original={:#x}, every_n={}",
+                original, every_n
+            ));
+            return;
+        }
+    }
+}
+
+#[inline]
+fn should_sample_original_method(original: u64) -> bool {
+    if original == 0 {
+        return true;
+    }
+    for i in 0..HOT_METHOD_SAMPLER_SLOTS {
+        let sampled_original =
+            HOT_METHOD_SAMPLER_ORIGINALS[i].load(std::sync::atomic::Ordering::Acquire);
+        if sampled_original == 0 {
+            continue;
+        }
+        if sampled_original != original {
+            continue;
+        }
+        let every_n = HOT_METHOD_SAMPLER_EVERY_N[i].load(std::sync::atomic::Ordering::Relaxed);
+        if every_n <= 1 {
+            return true;
+        }
+        let count = HOT_METHOD_SAMPLER_COUNTERS[i]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        return count % every_n as u64 == 0;
+    }
+    true
+}
 
 pub(crate) struct CallbackGateGuard;
 impl Drop for CallbackGateGuard {
@@ -741,19 +816,32 @@ impl Drop for CallbackGateGuard {
 
 pub(super) static DO_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 pub(super) static DO_CALL_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(super) static DO_CALL_QUICK_CALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(super) static GET_OAT_HOOK_POOL_ORIGINAL_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(super) static GET_OAT_HOOK_POOL_REPLACEMENT_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(super) static GET_OAT_HOOK_POOL_LAST_METHOD: AtomicU64 = AtomicU64::new(0);
+pub(super) static GET_OAT_HOOK_POOL_LAST_PC: AtomicU64 = AtomicU64::new(0);
 /// DoCall on_enter: 检查 x0 (ArtMethod*) 是否在 replacedMethods 中，有则替换。
 /// 包含递归防护: 如果当前栈帧来自 callOriginal (managedStack 中已有 replacement)，
 /// 则跳过替换，让 original method 正常执行，防止无限递归。
-unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user_data: *mut std::ffi::c_void) {
+unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, user_data: *mut std::ffi::c_void) {
     if ctx_ptr.is_null() {
         return;
     }
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0];
     DO_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let route_mode = hook_ffi::hook_art_router_record_do_call(method);
 
     // 默认: miss → tail-jump (原函数跑完不回 thunk, 无栈帧残留)
     ctx.intercept_leave = 0;
+
+    if route_mode == 1 && crate::lua::is_lua_hook(method) {
+        let is_range = (user_data as usize) != 0;
+        crate::lua::callback::lua_hook_dispatch_from_do_call(ctx_ptr, is_range);
+        DO_CALL_QUICK_CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
 
     if let Some(replacement) = get_replacement_method(method) {
         DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -916,6 +1004,9 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     // Lua hook 快速路径: 无 JS engine 锁, 无 cooldown gate, 每次都执行
     let original_for_lua = hook_ffi::hook_art_router_table_lookup_original(replacement);
     if original_for_lua != 0 && crate::lua::is_lua_hook(original_for_lua) {
+        if !should_sample_original_method(original_for_lua) {
+            return 0;
+        }
         // Lua hook: 只检查 bypass 栈和 managed stack
         let stack = get_bypass_stack();
         if !stack.is_empty() {
@@ -926,6 +1017,15 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
             }
         }
         return if should_replace_for_stack(replacement) { 1 } else { 0 };
+    }
+
+    let original_for_js = if original_for_lua != 0 {
+        original_for_lua
+    } else {
+        hook_ffi::hook_art_router_table_lookup_original(replacement)
+    };
+    if !should_sample_original_method(original_for_js) {
+        return 0;
     }
 
     // JS hook: JS engine busy 检测 + cooldown gate
@@ -991,7 +1091,15 @@ unsafe extern "C" fn on_pretty_method_enter(ctx_ptr: *mut hook_ffi::HookContext,
             ctx.x[0] = last;
         }
     } else {
-        LAST_SEEN_ART_METHOD.store(method, Ordering::Relaxed);
+        let original = hook_ffi::hook_art_router_table_lookup_original(method);
+        if original != 0 {
+        // replacement ArtMethod is only a native stack-walk sentinel.  PrettyMethod
+        // must parse the real method, otherwise ART may follow stale clone metadata.
+            ctx.x[0] = original;
+            LAST_SEEN_ART_METHOD.store(original, Ordering::Relaxed);
+        } else {
+            LAST_SEEN_ART_METHOD.store(method, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1027,6 +1135,19 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
     }
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0]; // ArtMethod* this
+    let pc = ctx.x[1];
+
+    if hook_ffi::hook_is_in_exec_pool(pc) != 0 {
+        if get_replacement_method(method).is_some() {
+            GET_OAT_HOOK_POOL_ORIGINAL_COUNT.fetch_add(1, Ordering::Relaxed);
+            GET_OAT_HOOK_POOL_LAST_METHOD.store(method, Ordering::Relaxed);
+            GET_OAT_HOOK_POOL_LAST_PC.store(pc, Ordering::Relaxed);
+        } else if is_replacement_method(method) {
+            GET_OAT_HOOK_POOL_REPLACEMENT_COUNT.fetch_add(1, Ordering::Relaxed);
+            GET_OAT_HOOK_POOL_LAST_METHOD.store(method, Ordering::Relaxed);
+            GET_OAT_HOOK_POOL_LAST_PC.store(pc, Ordering::Relaxed);
+        }
+    }
 
     if is_replacement_method(method) {
         // replacement method → NULL (让 StackVisitor 走 IsNative 兜底)
@@ -1085,13 +1206,17 @@ unsafe fn synchronize_replacement_methods() {
         // --- Fix 1: declaring_class_ 同步 ---
         // 移动 GC 会更新原始 ArtMethod 的 declaring_class_ (offset 0, 4 bytes GcRoot)，
         // 堆分配的 replacement 不会被 GC 追踪，需要同步以防悬空引用。
-        // 2-ArtMethod 模型: clone 已去掉，只同步 replacement。
+        // Quick hooks use a Process.getElapsedCpuTime() sentinel as the stack-walk
+        // method, so its declaring_class_/dex metadata must not be overwritten with
+        // the hooked method's class.
         {
             let declaring_class = std::ptr::read_volatile(art_method as *const u32);
-            // 同步 replacement 的 declaring_class_ (对标 Frida synchronize_replacement_methods)
-            let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
-            if *replacement_addr != 0 {
-                std::ptr::write_volatile(*replacement_addr as *mut u32, declaring_class);
+            let replacement_addr = match &data.hook_type {
+                HookType::Replaced { replacement_addr, .. } => *replacement_addr,
+                HookType::Quick { .. } => 0,
+            };
+            if replacement_addr != 0 {
+                std::ptr::write_volatile(replacement_addr as *mut u32, declaring_class);
             }
         }
 
@@ -1106,7 +1231,10 @@ unsafe fn synchronize_replacement_methods() {
 
         // --- Fix 2 + existing: entry_point 验证与恢复 ---
         // 对标 Frida synchronize_replacement_methods: nterp → quick_to_interpreter_bridge
-        let HookType::Replaced { per_method_hook_target, .. } = &data.hook_type;
+        let per_method_hook_target = match &data.hook_type {
+            HookType::Replaced { per_method_hook_target, .. }
+            | HookType::Quick { per_method_hook_target, .. } => per_method_hook_target,
+        };
         if per_method_hook_target.is_none() {
             // 共享 stub 方法: 如果 GC 重置 entry_point 为 nterp，再降级为 interpreter_bridge
             if nterp != 0 && interp_bridge != 0 {
@@ -1204,6 +1332,27 @@ unsafe fn install_walkstack_sigsegv_guard() {
             std::io::Error::last_os_error()
         ));
         WALKSTACK_GUARD_INSTALLED.store(false, Ordering::SeqCst);
+    }
+}
+
+pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
+    let mut current: libc::sigaction = std::mem::zeroed();
+    if libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
+        return;
+    }
+    if current.sa_sigaction == walkstack_sigsegv_handler as usize {
+        return;
+    }
+
+    let mut sa: libc::sigaction = std::mem::zeroed();
+    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+    libc::sigemptyset(&mut sa.sa_mask);
+
+    let mut previous: libc::sigaction = std::mem::zeroed();
+    if libc::sigaction(libc::SIGSEGV, &sa, &mut previous) == 0 {
+        PREV_SIGSEGV_ACTION = previous;
+        WALKSTACK_GUARD_INSTALLED.store(true, Ordering::SeqCst);
     }
 }
 

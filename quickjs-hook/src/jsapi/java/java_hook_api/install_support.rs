@@ -1,5 +1,5 @@
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::console::output_verbose;
+use crate::jsapi::console::{output_message, output_verbose};
 
 use super::super::art_controller::prepare_hook_target;
 use super::super::art_method::*;
@@ -178,6 +178,75 @@ pub(super) unsafe fn create_replacement_art_method(
     Ok(repl)
 }
 
+pub(super) unsafe fn create_quick_stack_sentinel_art_method(
+    env: JniEnv,
+    clone_size: usize,
+    spec: &ArtMethodSpec,
+    data_off: usize,
+    ep_offset: usize,
+    stack_entry_point: u64,
+) -> Result<usize, String> {
+    const K_ACC_STATIC: u32 = 0x0008;
+
+    let sentinel_src = get_known_native_art_method(env)
+        .ok_or("failed to resolve Process.getElapsedCpuTime sentinel ArtMethod")?;
+    if (sentinel_src & 0x3) != 0 {
+        return Err(format!(
+            "Process.getElapsedCpuTime sentinel ArtMethod is still tagged/opaque: {:#x}",
+            sentinel_src
+        ));
+    }
+    let ptr = libc::malloc(clone_size);
+    if ptr.is_null() {
+        return Err("malloc failed for quick stack sentinel ArtMethod".to_string());
+    }
+    std::ptr::copy_nonoverlapping(sentinel_src as *const u8, ptr as *mut u8, clone_size);
+
+    let repl = ptr as usize;
+    let src_declaring_class = std::ptr::read_volatile(sentinel_src as *const u32);
+    let src_dex_method_index = std::ptr::read_volatile((sentinel_src as usize + 12) as *const u32);
+    let src_flags =
+        std::ptr::read_volatile((sentinel_src as usize + spec.access_flags_offset) as *const u32);
+    if src_declaring_class == 0 || src_declaring_class == 1 {
+        libc::free(ptr);
+        return Err(format!(
+            "invalid Process.getElapsedCpuTime declaring_class={:#x}, src={:#x}",
+            src_declaring_class, sentinel_src
+        ));
+    }
+    if (src_flags & (K_ACC_NATIVE | K_ACC_STATIC)) != (K_ACC_NATIVE | K_ACC_STATIC) {
+        libc::free(ptr);
+        return Err(format!(
+            "Process.getElapsedCpuTime is not static native: src={:#x}, flags={:#x}",
+            sentinel_src, src_flags
+        ));
+    }
+    let repl_flags = (src_flags
+        & !(K_ACC_CRITICAL_NATIVE | K_ACC_FAST_NATIVE | K_ACC_NTERP_ENTRY_POINT_FAST_PATH))
+        | K_ACC_NATIVE
+        | K_ACC_STATIC
+        | k_acc_compile_dont_bother();
+    std::ptr::write_volatile((repl + spec.access_flags_offset) as *mut u32, repl_flags);
+    std::ptr::write_volatile((repl + data_off) as *mut u64, 0);
+    std::ptr::write_volatile((repl + ep_offset) as *mut u64, stack_entry_point);
+    hook_ffi::hook_flush_cache(ptr, clone_size);
+
+    let repl_declaring_class = std::ptr::read_volatile(repl as *const u32);
+    let repl_dex_method_index = std::ptr::read_volatile((repl + 12) as *const u32);
+    let repl_data = std::ptr::read_volatile((repl + data_off) as *const u64);
+    let repl_ep = std::ptr::read_volatile((repl + ep_offset) as *const u64);
+    output_message(&format!(
+        "[java hook] quick stack sentinel: src={:#x}, addr={:#x}, decl={:#x}->{:#x}, dex_idx={:#x}->{:#x}, flags={:#x}->{:#x}, data_off={}, ep_off={}, data={:#x}, ep={:#x}",
+        sentinel_src, repl,
+        src_declaring_class, repl_declaring_class,
+        src_dex_method_index, repl_dex_method_index,
+        src_flags, repl_flags,
+        data_off, ep_offset, repl_data, repl_ep
+    ));
+
+    Ok(repl)
+}
+
 pub(super) unsafe fn update_original_method_flags_for_hook(
     art_method: u64,
     access_flags_offset: usize,
@@ -207,7 +276,8 @@ pub(super) unsafe fn install_per_method_router_hook(
     env: JniEnv,
     art_method: u64,
     _force_interpreter_route: bool,
-) -> Result<(Option<u64>, u64, bool), String> {
+    enable_fast_orig: bool,
+) -> Result<(Option<u64>, u64, bool, Option<u64>), String> {
     if has_independent_code {
         // Layer 3: inline hook quickCode 作为快速路径 (直接调用场景)
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -222,7 +292,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             &mut hooked_target,
             1, // skip_resolve
             0, // no hint — replacement is kAccNative, ART handles it
-            0, // use_blr=0: BLR do_orig 路径需调试，暂用 BR
+            if enable_fast_orig { 1 } else { 0 },
         );
 
         if trampoline.is_null() {
@@ -239,6 +309,10 @@ pub(super) unsafe fn install_per_method_router_hook(
         } else {
             original_entry_point
         };
+        let router_thunk_body =
+            hook_ffi::hook_art_router_get_thunk_body(actual_hook_target as *mut std::ffi::c_void)
+                as u64;
+        let router_thunk_body = (router_thunk_body != 0).then_some(router_thunk_body);
 
         // 诊断: 验证 inline hook 的 patch 是否真正写入
         let current_ep = std::ptr::read_volatile((art_method as usize + ep_offset) as *const u64);
@@ -250,7 +324,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             hooked_bytes[0], hooked_bytes[1], hooked_bytes[2], hooked_bytes[3]
         ));
 
-        Ok((Some(actual_hook_target), trampoline as u64, true))
+        Ok((Some(actual_hook_target), trampoline as u64, enable_fast_orig, router_thunk_body))
     } else {
         // 非 compiled 方法: entry_point 是共享 stub (nterp/interpreter_bridge/resolution)
         // 如果 entry_point 不是 Layer 1 已 hook 的 interpreter_bridge/resolution_trampoline,
@@ -280,6 +354,6 @@ pub(super) unsafe fn install_per_method_router_hook(
                 original_entry_point
             ));
         }
-        Ok((None, 0, false))
+        Ok((None, 0, false, None))
     }
 }

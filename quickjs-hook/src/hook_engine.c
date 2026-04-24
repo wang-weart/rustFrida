@@ -82,6 +82,38 @@ void hook_engine_clear_pool_ranges(void) {
     g_retained_pool_range_count = 0;
 }
 
+int hook_is_in_exec_pool(uint64_t pc) {
+    if (pc == 0) return 0;
+
+    uint64_t base = (uint64_t)(uintptr_t)g_engine.exec_mem;
+    uint64_t size = (uint64_t)g_engine.exec_mem_size;
+    if (base != 0 && size != 0 && pc >= base && pc < base + size) {
+        return 1;
+    }
+
+    int pool_count = g_engine.pool_count;
+    if (pool_count > MAX_EXEC_POOLS) pool_count = MAX_EXEC_POOLS;
+    for (int i = 0; i < pool_count; i++) {
+        base = (uint64_t)(uintptr_t)g_engine.pools[i].base;
+        size = (uint64_t)g_engine.pools[i].size;
+        if (base != 0 && size != 0 && pc >= base && pc < base + size) {
+            return 1;
+        }
+    }
+
+    int retained_count = g_retained_pool_range_count;
+    if (retained_count > MAX_EXEC_POOLS) retained_count = MAX_EXEC_POOLS;
+    for (int i = 0; i < retained_count; i++) {
+        base = g_retained_pool_ranges[i].base;
+        size = g_retained_pool_ranges[i].size;
+        if (base != 0 && size != 0 && pc >= base && pc < base + size) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 /* --- Diagnostic log infrastructure --- */
 
 HookLogFn g_log_fn = NULL;

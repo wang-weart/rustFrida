@@ -167,10 +167,11 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             let js_ctx = ffi::JS_NewObject(ctx);
             let hook_ctx = &*ctx_ptr;
             let env: JniEnv = hook_ctx.x[0] as JniEnv;
+            let atoms = hot_atoms();
 
             // thisObj for instance methods (x1 = jobject this)
             if !is_static {
-                set_js_u64_property(ctx, js_ctx, "thisObj", hook_ctx.x[1]);
+                set_js_u64_property_atom(ctx, js_ctx, atoms.this_obj, hook_ctx.x[1]);
             }
 
             // args[] — ARM64 JNI calling convention (GP x2-x7, FP d0-d7 independent)
@@ -189,16 +190,16 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                     let val = marshal_jni_arg_to_js(ctx, env, raw, fp_raw, type_sig);
                     ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
                 }
-                JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
+                set_js_value_property_atom(ctx, js_ctx, atoms.args, arr);
             }
 
             // env (JNIEnv* — from x0)
-            set_js_u64_property(ctx, js_ctx, "env", hook_ctx.x[0]);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.env, hook_ctx.x[0]);
 
             // Bind per-callback state to the JS context object so orig()
             // remains valid across nested hook callbacks and JS-side wrappers.
-            set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", ctx_ptr as usize as u64);
-            set_js_u64_property(ctx, js_ctx, "__hookArtMethod", art_method_addr);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, ctx_ptr as usize as u64);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_art_method, art_method_addr);
 
             // orig()
             set_js_cfunction_property(ctx, js_ctx, "orig", js_call_original, 0);
@@ -229,7 +230,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                         // 优先从 __origJobject 读取原始 JNI ref（ctx.orig() 对 unboxed 值设置）。
                         // 确保 String/Integer/Boolean/Array 等所有类型安全 round-trip。
                         if result_val.is_object() {
-                            let orig = result_val.get_property(ctx, "__origJobject");
+                            let atoms = hot_atoms();
+                            let orig_raw = ffi::qjs_get_property(ctx, result_val.raw(), atoms.orig_jobject);
+                            let orig = JSValue(orig_raw);
                             if !orig.is_undefined() && !orig.is_null() {
                                 let r = js_value_to_u64_or_zero(ctx, orig);
                                 orig.free(ctx);
@@ -330,14 +333,15 @@ unsafe fn js_result_to_raw(
                 // js_call_original L/[ 返回两种 shape:
                 //   {__jptr, __jclass}        — 普通 Object
                 //   {value, __origJobject}    — unboxed (String/Integer 等)
-                let origj = result_val.get_property(ctx, "__origJobject");
+                let atoms = hot_atoms();
+                let origj = JSValue(ffi::qjs_get_property(ctx, result_val.raw(), atoms.orig_jobject));
                 if !origj.is_undefined() && !origj.is_null() {
                     let r = js_value_to_u64_or_zero(ctx, origj);
                     origj.free(ctx);
                     return r;
                 }
                 origj.free(ctx);
-                let jptr = result_val.get_property(ctx, "__jptr");
+                let jptr = JSValue(ffi::qjs_get_property(ctx, result_val.raw(), atoms.jptr));
                 if !jptr.is_undefined() && !jptr.is_null() {
                     let r = js_value_to_u64_or_zero(ctx, jptr);
                     jptr.free(ctx);
@@ -409,46 +413,32 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     ctx_ptr: *mut hook_ffi::HookContext,
     user_data: *mut std::ffi::c_void,
 ) {
-    // 最早的 log — 确认函数是否被调用
-    crate::jsapi::console::output_verbose("[dispatch] ENTRY");
     if ctx_ptr.is_null() || user_data.is_null() {
         return;
     }
     let _in_flight_guard = InFlightJavaHookGuard::enter();
     let _callback_scope = JavaHookCallbackScope::enter();
+    let _gate_guard = crate::jsapi::java::art_controller::CallbackGateGuard;
 
     let art_method_addr = user_data as u64;
 
     // 复制 callback 数据，然后释放 lock
-    let (
-        ctx_usize,
-        callback_bytes,
-        is_static,
-        param_count,
-        return_type,
-        return_type_sig,
-        param_types,
-        class_global_ref,
-        quick_trampoline,
-    ) = {
+    let (ctx_usize, callback_bytes, is_static, param_count, return_type, param_types) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => {
-                (*ctx_ptr).x[0] = 0;
                 return;
             }
         };
         let registry = match guard.as_ref() {
             Some(r) => r,
             None => {
-                (*ctx_ptr).x[0] = 0;
                 return;
             }
         };
         let hook_data = match registry.get(&art_method_addr) {
             Some(d) => d,
             None => {
-                (*ctx_ptr).x[0] = 0;
                 return;
             }
         };
@@ -458,42 +448,10 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
             hook_data.is_static,
             hook_data.param_count,
             hook_data.return_type,
-            hook_data.return_type_sig.clone(),
             hook_data.param_types.clone(),
-            hook_data.class_global_ref,
-            hook_data.quick_trampoline,
         )
     }; // lock released
 
-    // 通过 JNI 标准接口获取当前线程的 JNIEnv*
-    // Android 16+ Thread* 通过 TLS 访问，x19 不再是 Thread*
-    let env: JniEnv = match crate::jsapi::java::jni_core::get_thread_env() {
-        Ok(e) => e,
-        Err(e) => {
-            crate::jsapi::console::output_verbose(&format!(
-                "[dispatch] get_thread_env failed: {}, art_method={:#x}",
-                e, art_method_addr
-            ));
-            return;
-        }
-    };
-
-    // Quick code 上下文中不能调 JNI 函数 (没有 JNI transition frame)。
-    // 参数不做 marshal, 对象参数以原始值传给 JS (BigUint64)。
-    // callOriginal (ctx.orig()) 走 clone+JNI, 有完整 JNI 环境。
-    let mut result_was_set = false;
-
-    crate::jsapi::console::output_verbose(&format!(
-        "[dispatch] BEFORE invoke_hook_callback_common: art_method={:#x}, ctx={:#x}",
-        art_method_addr, ctx_usize
-    ));
-
-    // DEBUG: 跳过所有操作，纯 return（验证 dispatch+RET 本身是否安全）
-    crate::jsapi::console::output_verbose("[dispatch] PURE RETURN (no JS, no clone)");
-    (*ctx_ptr).x[0] = 0; // 返回 null/0
-    return;
-
-    #[allow(unreachable_code)]
     invoke_hook_callback_common(
         ctx_usize,
         &callback_bytes,
@@ -503,82 +461,70 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
         |ctx| {
             let js_ctx = ffi::JS_NewObject(ctx);
             let hook_ctx = &*ctx_ptr;
+            let atoms = hot_atoms();
 
             // thisObj: 原始值 (BigUint64)
             if !is_static {
-                set_js_u64_property(ctx, js_ctx, "thisObj", hook_ctx.x[1]);
+                set_js_u64_property_atom(ctx, js_ctx, atoms.this_obj, hook_ctx.x[1]);
             }
 
             // args[] — 从寄存器读取原始值, 不转 JNI handle
             {
                 let arr = ffi::JS_NewArray(ctx);
-                let mut gp_index: usize = 0;
+                let mut gp_index: usize = if is_static { 1 } else { 2 };
                 let mut fp_index: usize = 0;
                 for i in 0..param_count {
                     let type_sig = param_types.get(i).map(|s| s.as_str());
                     let is_fp = is_floating_point_type(type_sig);
-                    let (raw, fp_raw) =
-                        extract_jni_arg(hook_ctx, is_fp, &mut gp_index, &mut fp_index);
-                    // 所有参数以原始值传递, 不调 JNI marshal
+                    let (raw, fp_raw) = if is_fp {
+                        let fp_raw = if fp_index < 8 { hook_ctx.d[fp_index] } else { 0 };
+                        fp_index += 1;
+                        (0, fp_raw)
+                    } else {
+                        let raw = if gp_index < 8 {
+                            hook_ctx.x[gp_index]
+                        } else {
+                            let sp = hook_ctx.sp as usize;
+                            *((sp + (gp_index - 8) * 8) as *const u64)
+                        };
+                        gp_index += 1;
+                        (raw, 0)
+                    };
+                    // Quick path 不做 JNI marshal。对象/数组以裸 mirror 指针传给 JS。
                     let val = match type_sig.map(|s| s.as_bytes().first().copied()) {
                         Some(Some(b'Z')) => JSValue::bool(raw != 0).raw(),
                         Some(Some(b'B')) => JSValue::int(raw as i8 as i32).raw(),
+                        Some(Some(b'C')) => JSValue::int(raw as u16 as i32).raw(),
                         Some(Some(b'S')) => JSValue::int(raw as i16 as i32).raw(),
                         Some(Some(b'I')) => JSValue::int(raw as i32).raw(),
+                        Some(Some(b'J')) => ffi::JS_NewBigUint64(ctx, raw),
                         Some(Some(b'F')) => JSValue::float(f32::from_bits(fp_raw as u32) as f64).raw(),
                         Some(Some(b'D')) => JSValue::float(f64::from_bits(fp_raw)).raw(),
                         _ => ffi::JS_NewBigUint64(ctx, raw), // J, L, [, 等 → BigUint64
                     };
                     ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
                 }
-                JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
+                set_js_value_property_atom(ctx, js_ctx, atoms.args, arr);
             }
 
-            set_js_u64_property(ctx, js_ctx, "env", env as u64);
-            set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", ctx_ptr as usize as u64);
-            set_js_u64_property(ctx, js_ctx, "__hookArtMethod", art_method_addr);
-            set_js_cfunction_property(ctx, js_ctx, "orig", js_call_original, 0);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.env, 0);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, ctx_ptr as usize as u64);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_art_method, art_method_addr);
 
             js_ctx
         },
-        // 处理返回值
-        |_ctx, _js_ctx, _result| {
-            result_was_set = true;
-            // 返回值由 ctx.orig() 设置 (通过 invoke_original_jni)
-            // 如果 JS 没调 orig(), 返回值为 0/null
+        // undefined = 继续原函数；其他值 = 直接替换返回值
+        |ctx, _js_ctx, result| {
+            let result_val = JSValue(result);
+            if result_val.is_undefined() {
+                return;
+            }
+            if return_type != b'V' {
+                (*ctx_ptr).x[0] = js_result_to_raw(ctx, result_val, return_type);
+            }
+            (*ctx_ptr).intercept_leave = 1;
         },
-        // on_js_exception: Quick dispatch 这条路 (debug 模式, 未启用)
+        // JS 异常时保持默认 action=call original。
         |_ctx, _js_ctx| {},
     );
-
-    // Fallback + 默认路径: 调用原始方法 via JNI (2-ArtMethod 模型)
-    // JNI CallNonvirtualMethodA 会建立完整的 JNI transition frame
-    if !result_was_set {
-        if !env.is_null() {
-            let hook_ctx = &*ctx_ptr;
-            let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
-            let jargs_ptr = if param_count > 0 {
-                jargs.as_ptr() as *const std::ffi::c_void
-            } else {
-                std::ptr::null()
-            };
-            // x[1] 在 Layer 1/2 路径不是 receiver, 强制静态调用
-            let ret_raw = invoke_original_jni(
-                env,
-                art_method_addr,
-                class_global_ref,
-                0, // receiver=0, 用静态调用
-                return_type,
-                true, // 强制 is_static
-                jargs_ptr,
-                quick_trampoline,
-                false, // dispatch_from_quick 路径不用 BLR fast orig
-            );
-            if return_type != b'V' {
-                (*ctx_ptr).x[0] = ret_raw;
-            }
-        } else {
-            (*ctx_ptr).x[0] = 0;
-        }
-    }
 }
