@@ -2367,6 +2367,31 @@ fn emit_let(
     Ok(())
 }
 
+fn emit_let_orig(ir: &mut DexIrBuilder, name: &str, type_name: &str, emit_ctx: &EmitContext<'_>) -> Result<(), String> {
+    if emit_ctx.return_type == "V" {
+        return Err("void orig() cannot be assigned to a local".to_string());
+    }
+    let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
+    if !value_descriptor_assignable_to(emit_ctx.return_type, &descriptor) {
+        return Err(format!(
+            "orig() return type {} cannot be assigned to {}",
+            emit_ctx.return_type, descriptor
+        ));
+    }
+    let slot = emit_ctx
+        .layout
+        .local_regs
+        .get(name)
+        .ok_or_else(|| format!("local '{}' is not allocated", name))?;
+    if emit_ctx.is_static {
+        ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
+    } else {
+        ir.invoke_virtual_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
+    }
+    emit_move_result_value(ir, emit_ctx.return_type, slot.reg)?;
+    Ok(())
+}
+
 fn emit_if_null(
     ir: &mut DexIrBuilder,
     value: &DslValue,
@@ -2767,6 +2792,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
     for stmt in stmts {
         let words = match stmt {
             DslStmt::Let { value, .. } => value_max_invoke_words(value)?,
+            DslStmt::LetOrig { .. } => 0,
             DslStmt::New { ctor_sig, args, .. } => {
                 let params = if let Some(sig) = ctor_sig {
                     let (params, return_type) = parse_method_signature(sig)?;
@@ -2892,7 +2918,7 @@ fn statements_use_orig(stmts: &[DslStmt]) -> bool {
 
 fn stmt_uses_orig(stmt: &DslStmt) -> bool {
     match stmt {
-        DslStmt::ReturnOrig => true,
+        DslStmt::ReturnOrig | DslStmt::LetOrig { .. } => true,
         DslStmt::IfNull {
             then_stmts, else_stmts, ..
         }
@@ -2961,12 +2987,86 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
 }
 
 fn validate_orig_bypass_flow(program: &DslProgram) -> Result<(), String> {
+    if program_uses_orig_value(program)? {
+        return validate_orig_value_flow(program);
+    }
     let flow = analyze_return_flow(&program.stmts);
     if flow.has_non_orig_return || flow.falls_through {
         return Err(
             "managed DSL uses orig(); every return path must end with return orig() for high-frequency direct bypass"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
+    fn visit(stmts: &[DslStmt], nested: bool, count: &mut usize) -> Result<(), String> {
+        for stmt in stmts {
+            match stmt {
+                DslStmt::LetOrig { .. } => {
+                    if nested {
+                        return Err("let x = orig() is only supported at top level".to_string());
+                    }
+                    *count += 1;
+                }
+                DslStmt::IfNull {
+                    then_stmts, else_stmts, ..
+                }
+                | DslStmt::IfCmp {
+                    then_stmts, else_stmts, ..
+                }
+                | DslStmt::IfInstanceOf {
+                    then_stmts, else_stmts, ..
+                } => {
+                    visit(then_stmts, true, count)?;
+                    visit(else_stmts, true, count)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let mut count = 0usize;
+    visit(&program.stmts, false, &mut count)?;
+    if count > 1 {
+        return Err("managed DSL supports at most one let x = orig()".to_string());
+    }
+    Ok(count == 1)
+}
+
+fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        DslStmt::ReturnOrig => true,
+        DslStmt::IfNull {
+            then_stmts, else_stmts, ..
+        }
+        | DslStmt::IfCmp {
+            then_stmts, else_stmts, ..
+        }
+        | DslStmt::IfInstanceOf {
+            then_stmts, else_stmts, ..
+        } => statements_contain_return_orig(then_stmts) || statements_contain_return_orig(else_stmts),
+        _ => false,
+    })
+}
+
+fn validate_orig_value_flow(program: &DslProgram) -> Result<(), String> {
+    let orig_pos = program
+        .stmts
+        .iter()
+        .position(|stmt| matches!(stmt, DslStmt::LetOrig { .. }))
+        .ok_or_else(|| "internal error: missing let x = orig()".to_string())?;
+    if statements_contain_return_orig(&program.stmts) {
+        return Err("let x = orig() cannot be mixed with return orig()".to_string());
+    }
+    if orig_pos != 0 {
+        return Err("let x = orig() must be the first top-level statement".to_string());
+    }
+    let flow = analyze_return_flow(&program.stmts[orig_pos + 1..]);
+    if flow.falls_through {
+        return Err("managed DSL using let x = orig() must return on every path after orig()".to_string());
     }
     Ok(())
 }
@@ -2985,7 +3085,7 @@ fn collect_local_slots_from_stmts(
 ) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
-            DslStmt::Let { name, type_name, .. } => {
+            DslStmt::Let { name, type_name, .. } | DslStmt::LetOrig { name, type_name } => {
                 if slots.contains_key(name) {
                     continue;
                 }
@@ -3112,6 +3212,10 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
     match stmt {
         DslStmt::Let { name, type_name, value } => {
             emit_let(ir, name, type_name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            Ok(false)
+        }
+        DslStmt::LetOrig { name, type_name } => {
+            emit_let_orig(ir, name, type_name, emit_ctx)?;
             Ok(false)
         }
         DslStmt::New {
@@ -3335,6 +3439,10 @@ enum DslStmt {
         name: String,
         type_name: String,
         value: DslValue,
+    },
+    LetOrig {
+        name: String,
+        type_name: String,
     },
     New {
         class_name: String,
@@ -3630,6 +3738,20 @@ impl<'a> DslParser<'a> {
         let type_name = self.parse_type_name()?;
         self.skip_ws();
         self.expect_char('=')?;
+        self.skip_ws();
+        if self.peek_ident("orig") {
+            self.expect_ident("orig")?;
+            self.skip_ws();
+            self.expect_char('(')?;
+            self.skip_ws();
+            self.expect_char(')')?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(DslStmt::LetOrig {
+                name: local_name,
+                type_name,
+            });
+        }
         let value = self.parse_value_arg()?;
         self.skip_ws();
         self.expect_char(';')?;

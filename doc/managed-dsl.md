@@ -208,6 +208,17 @@ High-frequency orig path:
 "return orig();"
 ```
 
+Orig result path:
+
+```js
+"let old: java.lang.Object = orig();" +
+"return old;"
+```
+
+`let x = orig()` is intentionally restricted: it must appear once as the first
+top-level statement, and it cannot be mixed with `return orig()`. This keeps the
+per-thread orig bypass consumed exactly once before any user DSL logic runs.
+
 Direct value returns are supported only for DSL programs that do not use
 `orig()`:
 
@@ -218,8 +229,9 @@ Direct value returns are supported only for DSL programs that do not use
 
 ## Current Limits
 
-- `orig()` cannot be mixed with `return null`, `return value`, or fall-through
-  return paths.
+- `return orig()` cannot be mixed with `return null`, `return value`, or
+  fall-through return paths.
+- `let x = orig()` must be the first top-level statement and cannot be nested.
 - Local variable type inference is not supported; use `let name: Type = value`.
 - Loops are not part of the JS-like managed DSL.
 - Try/catch, throw, monitor enter/exit, and synchronized blocks are not part of
