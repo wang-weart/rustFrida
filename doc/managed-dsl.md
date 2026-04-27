@@ -25,7 +25,7 @@ Java.ready(function () {
     dsl:
       "let n: int = this.size.overload()();" +
       "let plus: int = n + 1;" +
-      "new java.lang.StringBuilder(\"(Ljava/lang/String;)V\", \"seed\");" +
+      "new java.lang.StringBuilder(\"java.lang.String\", \"seed\");" +
       "let sb: java.lang.StringBuilder = last;" +
       "sb.append.overload(\"java.lang.Object\")(arg0);" +
       "new int[](3);" +
@@ -93,7 +93,7 @@ the parser, but the JS-like names above are preferred.
 ### Constructors
 
 ```js
-"new java.lang.StringBuilder(\"(Ljava/lang/String;)V\", \"seed\");"
+"new java.lang.StringBuilder(\"java.lang.String\", \"seed\");"
 ```
 
 For no-arg constructors:
@@ -103,6 +103,12 @@ For no-arg constructors:
 ```
 
 The new object is stored in `last`.
+
+Full JNI constructor signatures are still accepted as a fallback:
+
+```js
+"new java.lang.StringBuilder(\"(Ljava/lang/String;)V\", \"seed\");"
+```
 
 ### Method Calls
 

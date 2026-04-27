@@ -3561,19 +3561,98 @@ impl<'a> DslParser<'a> {
                 size,
             });
         }
-        let (ctor_sig, args) = if self.peek() == Some(')') {
-            (None, Vec::new())
-        } else {
-            let sig = self.parse_string_arg()?;
-            let args = self.parse_optional_value_args()?;
-            (Some(sig), args)
-        };
+        let (ctor_sig, args) = self.parse_new_constructor_args()?;
         self.expect_char(')')?;
         Ok(DslStmt::New {
             class_name,
             ctor_sig,
             args,
         })
+    }
+
+    fn parse_new_constructor_args(&mut self) -> Result<(Option<String>, Vec<DslValue>), String> {
+        enum NewArgToken {
+            String(String),
+            Value(DslValue),
+        }
+
+        fn token_to_value(token: NewArgToken) -> DslValue {
+            match token {
+                NewArgToken::String(value) => DslValue::String(value),
+                NewArgToken::Value(value) => value,
+            }
+        }
+
+        self.skip_ws();
+        if self.peek() == Some(')') {
+            return Ok((None, Vec::new()));
+        }
+
+        let mut tokens = Vec::new();
+        loop {
+            self.skip_ws();
+            let token = if self.peek() == Some('"') {
+                NewArgToken::String(self.parse_string_arg()?)
+            } else {
+                NewArgToken::Value(self.parse_value_arg()?)
+            };
+            tokens.push(token);
+            self.skip_ws();
+            if self.peek() != Some(',') {
+                break;
+            }
+            self.expect_char(',')?;
+        }
+
+        let Some(NewArgToken::String(first)) = tokens.first() else {
+            return Err(self.err("constructor arguments must start with a signature or parameter type list"));
+        };
+        if first.starts_with('(') {
+            let sig = first.clone();
+            let args = tokens
+                .into_iter()
+                .skip(1)
+                .map(token_to_value)
+                .collect::<Vec<_>>();
+            return Ok((Some(sig), args));
+        }
+
+        let mut resolved_type_count = None;
+        let mut resolved_sig = None;
+        if tokens.len() % 2 == 0 {
+            let type_count = tokens.len() / 2;
+            let mut params = Vec::with_capacity(type_count);
+            let mut all_types = true;
+            for token in &tokens[..type_count] {
+                let NewArgToken::String(type_name) = token else {
+                    all_types = false;
+                    break;
+                };
+                match java_class_to_descriptor_or_primitive(type_name) {
+                    Ok(desc) => params.push(desc),
+                    Err(_) => {
+                        all_types = false;
+                        break;
+                    }
+                }
+            }
+            if all_types {
+                resolved_type_count = Some(type_count);
+                resolved_sig = Some(build_method_sig(&params, "V"));
+            }
+        }
+
+        let Some(type_count) = resolved_type_count else {
+            return Err(self.err(
+                "constructor expects either a full JNI signature or parameter type list followed by matching args",
+            ));
+        };
+        let args = tokens
+            .into_iter()
+            .skip(type_count)
+            .map(token_to_value)
+            .collect::<Vec<_>>();
+        Ok((resolved_sig, args))
     }
 
     fn parse_js_if_statement(&mut self) -> Result<DslStmt, String> {
