@@ -200,6 +200,16 @@ conditions only support `==` and `!=`.
 "}"
 ```
 
+Compound conditions support JS-like `&&`, `||`, `!`, and parentheses:
+
+```js
+"if ((arg0 != null && arg1 != null) || !(arg0 instanceof java.lang.String)) {" +
+"  return orig();" +
+"} else {" +
+"  return orig();" +
+"}"
+```
+
 ### Returns
 
 High-frequency orig path:
@@ -233,6 +243,7 @@ Direct value returns are supported only for DSL programs that do not use
   fall-through return paths.
 - `let x = orig()` must be the first top-level statement and cannot be nested.
 - Local variable type inference is not supported; use `let name: Type = value`.
+- `switch` statements are not part of the JS-like managed DSL.
 - Loops are not part of the JS-like managed DSL.
 - Try/catch, throw, monitor enter/exit, and synchronized blocks are not part of
   the DSL.

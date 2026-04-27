@@ -3434,6 +3434,7 @@ struct DslProgram {
     stmts: Vec<DslStmt>,
 }
 
+#[derive(Clone)]
 enum DslStmt {
     Let {
         name: String,
@@ -3505,6 +3506,7 @@ enum DslStmt {
     },
 }
 
+#[derive(Clone)]
 struct DslCallStmt {
     kind: DslCallKind,
     target: Option<DslTarget>,
@@ -3527,6 +3529,7 @@ enum DslCallKind {
     Static,
 }
 
+#[derive(Clone)]
 struct DslFieldStmt {
     target: Option<DslTarget>,
     class_name: Option<String>,
@@ -3535,6 +3538,7 @@ struct DslFieldStmt {
     value: Option<DslValue>,
 }
 
+#[derive(Clone)]
 enum DslValue {
     Target(DslTarget),
     String(String),
@@ -3578,6 +3582,44 @@ enum DslCondition {
         value: DslValue,
         class_name: String,
     },
+    And(Box<DslCondition>, Box<DslCondition>),
+    Or(Box<DslCondition>, Box<DslCondition>),
+    Not(Box<DslCondition>),
+}
+
+impl DslCondition {
+    fn into_if_stmt(self, then_stmts: Vec<DslStmt>, else_stmts: Vec<DslStmt>) -> DslStmt {
+        match self {
+            DslCondition::Null { value, invert } => DslStmt::IfNull {
+                value,
+                invert,
+                then_stmts,
+                else_stmts,
+            },
+            DslCondition::Cmp { op, left, right } => DslStmt::IfCmp {
+                op,
+                left,
+                right,
+                then_stmts,
+                else_stmts,
+            },
+            DslCondition::InstanceOf { value, class_name } => DslStmt::IfInstanceOf {
+                value,
+                class_name,
+                then_stmts,
+                else_stmts,
+            },
+            DslCondition::And(left, right) => {
+                let inner = right.into_if_stmt(then_stmts, else_stmts.clone());
+                left.into_if_stmt(vec![inner], else_stmts)
+            }
+            DslCondition::Or(left, right) => {
+                let inner = right.into_if_stmt(then_stmts.clone(), else_stmts);
+                left.into_if_stmt(then_stmts, vec![inner])
+            }
+            DslCondition::Not(condition) => condition.into_if_stmt(else_stmts, then_stmts),
+        }
+    }
 }
 
 impl DslValue {
@@ -3613,6 +3655,7 @@ impl DslValue {
     }
 }
 
+#[derive(Clone)]
 enum DslTarget {
     This,
     Arg(usize),
@@ -3890,27 +3933,7 @@ impl<'a> DslParser<'a> {
         } else {
             Vec::new()
         };
-        Ok(match condition {
-            DslCondition::Null { value, invert } => DslStmt::IfNull {
-                value,
-                invert,
-                then_stmts,
-                else_stmts,
-            },
-            DslCondition::Cmp { op, left, right } => DslStmt::IfCmp {
-                op,
-                left,
-                right,
-                then_stmts,
-                else_stmts,
-            },
-            DslCondition::InstanceOf { value, class_name } => DslStmt::IfInstanceOf {
-                value,
-                class_name,
-                then_stmts,
-                else_stmts,
-            },
-        })
+        Ok(condition.into_if_stmt(then_stmts, else_stmts))
     }
 }
 
@@ -4355,6 +4378,53 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_js_condition(&mut self) -> Result<DslCondition, String> {
+        self.parse_js_or_condition()
+    }
+
+    fn parse_js_or_condition(&mut self) -> Result<DslCondition, String> {
+        let mut condition = self.parse_js_and_condition()?;
+        loop {
+            self.skip_ws();
+            if !self.input[self.pos..].starts_with("||") {
+                break;
+            }
+            self.pos += 2;
+            let right = self.parse_js_and_condition()?;
+            condition = DslCondition::Or(Box::new(condition), Box::new(right));
+        }
+        Ok(condition)
+    }
+
+    fn parse_js_and_condition(&mut self) -> Result<DslCondition, String> {
+        let mut condition = self.parse_js_unary_condition()?;
+        loop {
+            self.skip_ws();
+            if !self.input[self.pos..].starts_with("&&") {
+                break;
+            }
+            self.pos += 2;
+            let right = self.parse_js_unary_condition()?;
+            condition = DslCondition::And(Box::new(condition), Box::new(right));
+        }
+        Ok(condition)
+    }
+
+    fn parse_js_unary_condition(&mut self) -> Result<DslCondition, String> {
+        self.skip_ws();
+        if self.peek() == Some('!') {
+            self.expect_char('!')?;
+            return Ok(DslCondition::Not(Box::new(self.parse_js_unary_condition()?)));
+        }
+        if self.peek() == Some('(') {
+            self.expect_char('(')?;
+            let condition = self.parse_js_condition()?;
+            self.expect_char(')')?;
+            return Ok(condition);
+        }
+        self.parse_js_condition_leaf()
+    }
+
+    fn parse_js_condition_leaf(&mut self) -> Result<DslCondition, String> {
         let left = self.parse_value_arg()?;
         self.skip_ws();
         if self.peek_ident("instanceof") {
