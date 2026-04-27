@@ -4094,7 +4094,7 @@ enum DslTarget {
 }
 
 fn parse_managed_dsl(dsl: &str) -> Result<DslProgram, String> {
-    let mut parser = DslParser::new(dsl);
+    let mut parser = DslParser::new(dsl)?;
     let stmts = parser.parse_statements(false)?;
     parser.skip_ws();
     parser.expect_eof()?;
@@ -4420,80 +4420,195 @@ impl<'a> DslParser<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+enum DslTokenKind {
+    Ident(String),
+    String(String),
+    Number(String),
+    Symbol(char),
+    Op(&'static str),
+}
+
+#[derive(Clone, Debug)]
+struct DslToken {
+    kind: DslTokenKind,
+    byte: usize,
+}
+
+fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
+    let mut tokens = Vec::new();
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let ch = input[pos..].chars().next().unwrap();
+        if ch.is_whitespace() {
+            pos += ch.len_utf8();
+            continue;
+        }
+        let byte = pos;
+        if is_ident_start(ch) {
+            pos += ch.len_utf8();
+            while pos < input.len() {
+                let next = input[pos..].chars().next().unwrap();
+                if is_ident_continue(next) {
+                    pos += next.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(DslToken {
+                kind: DslTokenKind::Ident(input[byte..pos].to_string()),
+                byte,
+            });
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            pos += 1;
+            while pos < input.len() {
+                let next = input.as_bytes()[pos] as char;
+                if next.is_ascii_digit() {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            tokens.push(DslToken {
+                kind: DslTokenKind::Number(input[byte..pos].to_string()),
+                byte,
+            });
+            continue;
+        }
+        if ch == '"' {
+            pos += 1;
+            let mut out = String::new();
+            loop {
+                if pos >= input.len() {
+                    return Err(format!(
+                        "managed dex DSL parse error at byte {}: unterminated string",
+                        byte
+                    ));
+                }
+                let current = input[pos..].chars().next().unwrap();
+                pos += current.len_utf8();
+                match current {
+                    '"' => break,
+                    '\\' => {
+                        if pos >= input.len() {
+                            return Err(format!(
+                                "managed dex DSL parse error at byte {}: unterminated string escape",
+                                pos
+                            ));
+                        }
+                        let escaped = input[pos..].chars().next().unwrap();
+                        pos += escaped.len_utf8();
+                        match escaped {
+                            '"' => out.push('"'),
+                            '\\' => out.push('\\'),
+                            'n' => out.push('\n'),
+                            'r' => out.push('\r'),
+                            't' => out.push('\t'),
+                            other => {
+                                return Err(format!(
+                                    "managed dex DSL parse error at byte {}: unsupported string escape \\{}",
+                                    pos - other.len_utf8(),
+                                    other
+                                ));
+                            }
+                        }
+                    }
+                    other => out.push(other),
+                }
+            }
+            tokens.push(DslToken {
+                kind: DslTokenKind::String(out),
+                byte,
+            });
+            continue;
+        }
+        let rest = &input[pos..];
+        let op = if rest.starts_with("==") {
+            Some("==")
+        } else if rest.starts_with("!=") {
+            Some("!=")
+        } else if rest.starts_with("<=") {
+            Some("<=")
+        } else if rest.starts_with(">=") {
+            Some(">=")
+        } else if rest.starts_with("&&") {
+            Some("&&")
+        } else if rest.starts_with("||") {
+            Some("||")
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            pos += op.len();
+            tokens.push(DslToken {
+                kind: DslTokenKind::Op(op),
+                byte,
+            });
+            continue;
+        }
+        if "{}()[];:,.+-=<>!".contains(ch) {
+            pos += ch.len_utf8();
+            tokens.push(DslToken {
+                kind: DslTokenKind::Symbol(ch),
+                byte,
+            });
+            continue;
+        }
+        return Err(format!(
+            "managed dex DSL parse error at byte {}: unexpected character '{}'",
+            byte, ch
+        ));
+    }
+    Ok(tokens)
+}
+
 struct DslParser<'a> {
     input: &'a str,
+    tokens: Vec<DslToken>,
     pos: usize,
 }
 
 impl<'a> DslParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+    fn new(input: &'a str) -> Result<Self, String> {
+        Ok(Self {
+            input,
+            tokens: dsl_lex(input)?,
+            pos: 0,
+        })
     }
 
-    fn skip_ws(&mut self) {
-        while let Some(ch) = self.peek() {
-            if ch.is_whitespace() {
-                self.pos += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-    }
+    fn skip_ws(&mut self) {}
 
     fn expect_ident(&mut self, expected: &str) -> Result<(), String> {
-        if !self.input[self.pos..].starts_with(expected) {
-            return Err(self.err(&format!("expected identifier {}", expected)));
+        match self.tokens.get(self.pos).map(|token| &token.kind) {
+            Some(DslTokenKind::Ident(value)) if value == expected => {
+                self.pos += 1;
+                Ok(())
+            }
+            _ => Err(self.err(&format!("expected identifier {}", expected))),
         }
-        let end = self.pos + expected.len();
-        if self
-            .input
-            .get(end..)
-            .and_then(|s| s.chars().next())
-            .map(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-            .unwrap_or(false)
-        {
-            return Err(self.err(&format!("expected identifier {}", expected)));
-        }
-        self.pos = end;
-        Ok(())
     }
 
     fn peek_ident(&self, expected: &str) -> bool {
-        if !self.input[self.pos..].starts_with(expected) {
-            return false;
-        }
-        let end = self.pos + expected.len();
-        !self
-            .input
-            .get(end..)
-            .and_then(|s| s.chars().next())
-            .map(is_ident_continue)
-            .unwrap_or(false)
+        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(DslTokenKind::Ident(value)) if value == expected)
     }
 
     fn parse_ident(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        let Some(first) = self.peek() else {
-            return Err(self.err("expected identifier"));
-        };
-        if !is_ident_start(first) {
-            return Err(self.err("expected identifier"));
-        }
-        self.pos += first.len_utf8();
-        while let Some(ch) = self.peek() {
-            if is_ident_continue(ch) {
-                self.pos += ch.len_utf8();
-            } else {
-                break;
+        match self.tokens.get(self.pos).map(|token| &token.kind) {
+            Some(DslTokenKind::Ident(value)) => {
+                self.pos += 1;
+                Ok(value.clone())
             }
+            _ => Err(self.err("expected identifier")),
         }
-        Ok(self.input[start..self.pos].to_string())
     }
 
     fn expect_char(&mut self, expected: char) -> Result<(), String> {
         match self.peek() {
             Some(ch) if ch == expected => {
-                self.pos += ch.len_utf8();
+                self.pos += 1;
                 Ok(())
             }
             _ => Err(self.err(&format!("expected '{}'", expected))),
@@ -4508,37 +4623,18 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_string(&mut self) -> Result<String, String> {
-        self.expect_char('"')?;
-        let mut out = String::new();
-        loop {
-            let Some(ch) = self.peek() else {
-                return Err(self.err("unterminated string"));
-            };
-            self.pos += ch.len_utf8();
-            match ch {
-                '"' => return Ok(out),
-                '\\' => {
-                    let Some(escaped) = self.peek() else {
-                        return Err(self.err("unterminated string escape"));
-                    };
-                    self.pos += escaped.len_utf8();
-                    match escaped {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
-                        other => return Err(self.err(&format!("unsupported string escape \\{}", other))),
-                    }
-                }
-                other => out.push(other),
+        match self.tokens.get(self.pos).map(|token| &token.kind) {
+            Some(DslTokenKind::String(value)) => {
+                self.pos += 1;
+                Ok(value.clone())
             }
+            _ => Err(self.err("expected string")),
         }
     }
 
     fn parse_type_name(&mut self) -> Result<String, String> {
         self.skip_ws();
-        if self.peek() == Some('"') {
+        if self.peek_string() {
             return self.parse_string_arg();
         }
         let mut name = self.parse_ident()?;
@@ -4571,20 +4667,14 @@ impl<'a> DslParser<'a> {
         } else {
             false
         };
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() {
+        let value_text = match self.tokens.get(self.pos).map(|token| &token.kind) {
+            Some(DslTokenKind::Number(value)) => {
                 self.pos += 1;
-            } else {
-                break;
+                value.clone()
             }
-        }
-        if self.pos == start {
-            return Err(self.err("expected integer"));
-        }
-        let value: i32 = self.input[start..self.pos]
-            .parse()
-            .map_err(|_| self.err("invalid integer"))?;
+            _ => return Err(self.err("expected integer")),
+        };
+        let value: i32 = value_text.parse().map_err(|_| self.err("invalid integer"))?;
         let signed = if negative { -value } else { value };
         if signed < i16::MIN as i32 || signed > i16::MAX as i32 {
             return Err(self.err("integer must fit int16"));
@@ -4603,9 +4693,9 @@ impl<'a> DslParser<'a> {
 
     fn parse_value_arg(&mut self) -> Result<DslValue, String> {
         self.skip_ws();
-        let value = if self.peek() == Some('"') {
+        let value = if self.peek_string() {
             DslValue::String(self.parse_string()?)
-        } else if self.peek() == Some('-') || self.peek().map(|ch| ch.is_ascii_digit()).unwrap_or(false) {
+        } else if self.peek() == Some('-') || self.peek_number() {
             DslValue::Int(self.parse_i16()?)
         } else {
             let ident = self.parse_ident()?;
@@ -4866,10 +4956,10 @@ impl<'a> DslParser<'a> {
         let mut condition = self.parse_js_and_condition()?;
         loop {
             self.skip_ws();
-            if !self.input[self.pos..].starts_with("||") {
+            if !self.peek_op("||") {
                 break;
             }
-            self.pos += 2;
+            self.expect_op("||")?;
             let right = self.parse_js_and_condition()?;
             condition = DslCondition::Or(Box::new(condition), Box::new(right));
         }
@@ -4880,10 +4970,10 @@ impl<'a> DslParser<'a> {
         let mut condition = self.parse_js_unary_condition()?;
         loop {
             self.skip_ws();
-            if !self.input[self.pos..].starts_with("&&") {
+            if !self.peek_op("&&") {
                 break;
             }
-            self.pos += 2;
+            self.expect_op("&&")?;
             let right = self.parse_js_unary_condition()?;
             condition = DslCondition::And(Box::new(condition), Box::new(right));
         }
@@ -4971,17 +5061,17 @@ impl<'a> DslParser<'a> {
 
     fn parse_js_cmp_op(&mut self) -> Result<IfCmpOp, String> {
         self.skip_ws();
-        if self.input[self.pos..].starts_with("==") {
-            self.pos += 2;
+        if self.peek_op("==") {
+            self.expect_op("==")?;
             Ok(IfCmpOp::Eq)
-        } else if self.input[self.pos..].starts_with("!=") {
-            self.pos += 2;
+        } else if self.peek_op("!=") {
+            self.expect_op("!=")?;
             Ok(IfCmpOp::Ne)
-        } else if self.input[self.pos..].starts_with("<=") {
-            self.pos += 2;
+        } else if self.peek_op("<=") {
+            self.expect_op("<=")?;
             Ok(IfCmpOp::Le)
-        } else if self.input[self.pos..].starts_with(">=") {
-            self.pos += 2;
+        } else if self.peek_op(">=") {
+            self.expect_op(">=")?;
             Ok(IfCmpOp::Ge)
         } else if self.peek() == Some('<') {
             self.pos += 1;
@@ -4996,10 +5086,10 @@ impl<'a> DslParser<'a> {
 
     fn peek_js_cmp_op(&mut self) -> bool {
         self.skip_ws();
-        self.input[self.pos..].starts_with("==")
-            || self.input[self.pos..].starts_with("!=")
-            || self.input[self.pos..].starts_with("<=")
-            || self.input[self.pos..].starts_with(">=")
+        self.peek_op("==")
+            || self.peek_op("!=")
+            || self.peek_op("<=")
+            || self.peek_op(">=")
             || self.peek() == Some('<')
             || self.peek() == Some('>')
     }
@@ -5018,7 +5108,7 @@ impl<'a> DslParser<'a> {
     }
 
     fn expect_eof(&self) -> Result<(), String> {
-        if self.pos == self.input.len() {
+        if self.pos == self.tokens.len() {
             Ok(())
         } else {
             Err(self.err("unexpected trailing input"))
@@ -5026,15 +5116,50 @@ impl<'a> DslParser<'a> {
     }
 
     fn peek(&self) -> Option<char> {
-        self.input[self.pos..].chars().next()
+        match self.tokens.get(self.pos).map(|token| &token.kind) {
+            Some(DslTokenKind::Symbol(ch)) => Some(*ch),
+            _ => None,
+        }
+    }
+
+    fn peek_string(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(DslTokenKind::String(_))
+        )
+    }
+
+    fn peek_number(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|token| &token.kind),
+            Some(DslTokenKind::Number(_))
+        )
+    }
+
+    fn peek_op(&self, expected: &str) -> bool {
+        matches!(self.tokens.get(self.pos).map(|token| &token.kind), Some(DslTokenKind::Op(value)) if *value == expected)
+    }
+
+    fn expect_op(&mut self, expected: &str) -> Result<(), String> {
+        if self.peek_op(expected) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.err(&format!("expected operator {}", expected)))
+        }
     }
 
     fn is_eof(&self) -> bool {
-        self.pos == self.input.len()
+        self.pos == self.tokens.len()
     }
 
     fn err(&self, msg: &str) -> String {
-        format!("managed dex DSL parse error at byte {}: {}", self.pos, msg)
+        let byte = self
+            .tokens
+            .get(self.pos)
+            .map(|token| token.byte)
+            .unwrap_or_else(|| self.input.len());
+        format!("managed dex DSL parse error at byte {}: {}", byte, msg)
     }
 }
 
