@@ -4,6 +4,7 @@ mod ast;
 mod condition;
 pub(super) use ast::*;
 mod lexer;
+mod member;
 use lexer::TokenKind as DslTokenKind;
 mod parser;
 use parser::DslParser;
