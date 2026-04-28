@@ -2,6 +2,7 @@ use super::{build_method_sig, build_params_sig, java_class_to_descriptor_or_prim
 
 mod assignment;
 mod ast;
+mod ast_call;
 mod ast_condition;
 pub(super) use ast_condition::*;
 mod ast_stmt;
@@ -13,6 +14,7 @@ mod control_loop;
 mod control_switch;
 mod control_try;
 pub(super) use ast::*;
+pub(super) use ast_call::*;
 mod cursor;
 mod declaration;
 mod lexer;
