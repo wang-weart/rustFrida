@@ -17,7 +17,7 @@ impl<'a> DslParser<'a> {
     }
 
     pub(super) fn parse_named_statement_tail(&mut self, name: String, name_mark: DslMark) -> Result<DslStmt, String> {
-        if name == "let" && self.peek() != Some('(') {
+        if (name == "let" || name == "var") && self.peek() != Some('(') {
             return self.parse_let_statement();
         }
         if name == "count" && self.peek() == Some('(') {

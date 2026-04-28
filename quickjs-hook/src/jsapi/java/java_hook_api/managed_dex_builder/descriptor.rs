@@ -220,9 +220,9 @@ pub(super) fn common_value_descriptor_with_env(
 ) -> Result<Option<String>, String> {
     match (left, right) {
         (Some(left), Some(right)) if left == right => Ok(Some(left)),
-        (Some(left), Some(right)) if return_is_object(&left) && return_is_object(&right) => Ok(Some(
-            common_object_descriptor(env, &left, &right).unwrap_or_else(|| "Ljava/lang/Object;".to_string()),
-        )),
+        (Some(left), Some(right)) if return_is_object(&left) && return_is_object(&right) => {
+            Ok(Some(common_reference_descriptor(env, &left, &right)))
+        }
         (Some(desc), None) | (None, Some(desc)) if return_is_object(&desc) => Ok(Some(desc)),
         (None, None) => Ok(None),
         (Some(left), Some(right)) => Err(format!(
@@ -231,6 +231,52 @@ pub(super) fn common_value_descriptor_with_env(
         )),
         (Some(desc), None) | (None, Some(desc)) => Err(format!("ternary null branch cannot be assigned to {}", desc)),
     }
+}
+
+fn common_reference_descriptor(env: JniEnv, left: &str, right: &str) -> String {
+    if left == right {
+        return left.to_string();
+    }
+    if left.starts_with('[') || right.starts_with('[') {
+        return common_array_reference_descriptor(env, left, right);
+    }
+    common_object_descriptor(env, left, right).unwrap_or_else(|| "Ljava/lang/Object;".to_string())
+}
+
+fn common_array_reference_descriptor(env: JniEnv, left: &str, right: &str) -> String {
+    if left == right {
+        return left.to_string();
+    }
+    if left.starts_with('[') && right.starts_with('[') {
+        if let Some(common_array) = common_covariant_array_descriptor(env, left, right) {
+            return common_array;
+        }
+    }
+    match (left, right) {
+        ("Ljava/lang/Object;", _) | (_, "Ljava/lang/Object;") => "Ljava/lang/Object;".to_string(),
+        ("Ljava/lang/Cloneable;", array) | (array, "Ljava/lang/Cloneable;") if array.starts_with('[') => {
+            "Ljava/lang/Cloneable;".to_string()
+        }
+        ("Ljava/io/Serializable;", array) | (array, "Ljava/io/Serializable;") if array.starts_with('[') => {
+            "Ljava/io/Serializable;".to_string()
+        }
+        _ => "Ljava/lang/Object;".to_string(),
+    }
+}
+
+fn common_covariant_array_descriptor(env: JniEnv, left: &str, right: &str) -> Option<String> {
+    let left_component = array_component_descriptor(left).ok()?;
+    let right_component = array_component_descriptor(right).ok()?;
+    if left_component == right_component {
+        return Some(format!("[{}", left_component));
+    }
+    if return_is_object(&left_component) && return_is_object(&right_component) {
+        return Some(format!(
+            "[{}",
+            common_reference_descriptor(env, &left_component, &right_component)
+        ));
+    }
+    None
 }
 
 pub(super) fn descriptor_is_interface(env: JniEnv, desc: &str) -> bool {
@@ -759,4 +805,54 @@ pub(super) fn java_class_to_descriptor_or_primitive(type_name: &str) -> Result<S
         return Ok(value.to_string());
     }
     java_class_to_descriptor(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn common_value_descriptor_keeps_null_typed_as_reference() {
+        let env = std::ptr::null_mut();
+        assert_eq!(
+            common_value_descriptor_with_env(Some("[[I".to_string()), None, env).unwrap(),
+            Some("[[I".to_string())
+        );
+        assert_eq!(
+            common_value_descriptor_with_env(None, Some("Ljava/lang/String;".to_string()), env).unwrap(),
+            Some("Ljava/lang/String;".to_string())
+        );
+    }
+
+    #[test]
+    fn common_value_descriptor_preserves_covariant_array_types() {
+        let env = std::ptr::null_mut();
+        assert_eq!(
+            common_value_descriptor_with_env(
+                Some("[Ljava/lang/String;".to_string()),
+                Some("[Ljava/lang/Object;".to_string()),
+                env
+            )
+            .unwrap(),
+            Some("[Ljava/lang/Object;".to_string())
+        );
+        assert_eq!(
+            common_value_descriptor_with_env(
+                Some("[[Ljava/lang/String;".to_string()),
+                Some("[[Ljava/lang/Object;".to_string()),
+                env
+            )
+            .unwrap(),
+            Some("[[Ljava/lang/Object;".to_string())
+        );
+    }
+
+    #[test]
+    fn common_value_descriptor_falls_back_for_incompatible_primitive_arrays() {
+        let env = std::ptr::null_mut();
+        assert_eq!(
+            common_value_descriptor_with_env(Some("[I".to_string()), Some("[J".to_string()), env).unwrap(),
+            Some("Ljava/lang/Object;".to_string())
+        );
+    }
 }

@@ -5,12 +5,20 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) fn parse_target_n
         "this" | "$this" => Some(DslTarget::This),
         "last" | "$last" => Some(DslTarget::Last),
         "result" | "$result" => Some(DslTarget::Result),
-        value if value.starts_with("arg") => value[3..].parse::<usize>().ok().map(DslTarget::Arg),
+        value if arg_alias_index(value, "arg").is_some() => arg_alias_index(value, "arg").map(DslTarget::Arg),
         value if value.starts_with('$') => value[1..].parse::<usize>().ok().map(DslTarget::Arg),
-        value if value.starts_with('p') => value[1..].parse::<usize>().ok().map(DslTarget::Arg),
+        value if arg_alias_index(value, "p").is_some() => arg_alias_index(value, "p").map(DslTarget::Arg),
         value if is_local_ident(value) => Some(DslTarget::Local(value.to_string())),
         _ => None,
     }
+}
+
+fn arg_alias_index(value: &str, prefix: &str) -> Option<usize> {
+    let suffix = value.strip_prefix(prefix)?;
+    if suffix.is_empty() || !suffix.bytes().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<usize>().ok()
 }
 
 pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) fn looks_like_type_name(value: &str) -> bool {

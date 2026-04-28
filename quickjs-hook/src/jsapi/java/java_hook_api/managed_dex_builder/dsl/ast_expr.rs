@@ -7,6 +7,9 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslValue {
     Int(i16),
     Bool(bool),
     Null,
+    DefaultValue {
+        type_name: String,
+    },
     UnaryOp {
         op: DslUnaryOp,
         value: Box<DslValue>,

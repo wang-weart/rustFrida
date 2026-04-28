@@ -36,8 +36,12 @@ impl<'a> DslParser<'a> {
         let init_stmts = if self.peek() == Some(';') {
             self.expect_char(';')?;
             Vec::new()
-        } else if self.peek_ident("let") {
-            self.expect_ident("let")?;
+        } else if self.peek_ident("let") || self.peek_ident("var") {
+            if self.peek_ident("let") {
+                self.expect_ident("let")?;
+            } else {
+                self.expect_ident("var")?;
+            }
             self.parse_let_declarations_until(';')?
         } else {
             self.parse_for_header_statement_list(';', false)?
@@ -68,11 +72,15 @@ impl<'a> DslParser<'a> {
     fn parse_for_header_statement_list(&mut self, terminator: char, allow_let: bool) -> Result<Vec<DslStmt>, String> {
         let mut stmts = Vec::new();
         loop {
-            if self.peek_ident("let") {
+            if self.peek_ident("let") || self.peek_ident("var") {
                 if !allow_let {
-                    return Err(self.err("let declarations are only supported in for init"));
+                    return Err(self.err("local declarations are only supported in for init"));
                 }
-                self.expect_ident("let")?;
+                if self.peek_ident("let") {
+                    self.expect_ident("let")?;
+                } else {
+                    self.expect_ident("var")?;
+                }
                 stmts.extend(self.parse_let_declarations_until(terminator)?);
                 break;
             }

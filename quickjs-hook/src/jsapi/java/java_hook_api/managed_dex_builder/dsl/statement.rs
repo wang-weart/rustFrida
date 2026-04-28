@@ -15,6 +15,10 @@ impl<'a> DslParser<'a> {
                 self.expect_char('}')?;
                 break;
             }
+            if self.peek() == Some(';') {
+                self.expect_char(';')?;
+                continue;
+            }
             let stmt = self.parse_statement()?;
             stmts.push(stmt);
         }
@@ -38,6 +42,10 @@ impl<'a> DslParser<'a> {
 
     fn parse_statement(&mut self) -> Result<DslStmt, String> {
         self.skip_ws();
+        if self.peek() == Some(';') {
+            self.expect_char(';')?;
+            return Ok(DslStmt::Block(Vec::new()));
+        }
         if self.peek_ident("return") {
             self.expect_ident("return")?;
             self.skip_ws();

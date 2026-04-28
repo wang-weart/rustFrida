@@ -33,6 +33,16 @@ impl<'a> DslParser<'a> {
             None
         };
         self.skip_ws();
+        if self.peek() != Some('=') {
+            let Some(type_name) = type_name else {
+                return Err(self.err("uninitialized local declarations require an explicit type"));
+            };
+            return Ok(DslStmt::Let {
+                name: local_name,
+                type_name: Some(type_name.clone()),
+                value: DslValue::DefaultValue { type_name },
+            });
+        }
         self.expect_char('=')?;
         self.skip_ws();
         if self.peek_ident("orig") {

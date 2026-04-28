@@ -412,6 +412,7 @@ fn collect_value_strings(value: &DslValue, dsl_ctx: &mut DslBuildContext) {
         DslValue::String(value) => {
             dsl_ctx.string_literal_field(value);
         }
+        DslValue::DefaultValue { .. } => {}
         DslValue::UnaryOp { value, .. }
         | DslValue::Cast { value, .. }
         | DslValue::ArrayLength(value)
@@ -925,8 +926,31 @@ fn emit_load_value(
             ir.const4(temp_reg, 0);
             Ok(temp_reg)
         }
+        DslValue::DefaultValue { type_name } => {
+            let desc = java_class_to_descriptor_or_primitive(type_name)?;
+            if desc == "V" {
+                return Err("default value cannot be void".to_string());
+            }
+            if !value_descriptor_assignable_to(&desc, expected_type) {
+                return Err(format!("default {} cannot be passed as {}", desc, expected_type));
+            }
+            match desc.as_str() {
+                "J" | "D" => Err(format!("default value for {} is not supported yet", desc)),
+                desc if return_is_object(desc) || matches!(desc, "Z" | "B" | "C" | "S" | "I" | "F") => {
+                    ir.const4(temp_reg, 0);
+                    Ok(temp_reg)
+                }
+                other => Err(format!("unsupported default value type {}", other)),
+            }
+        }
         DslValue::UnaryOp { op, value } => emit_unary_value(ir, *op, value, expected_type, temp_reg, layout, dsl_ctx),
         DslValue::IntBinOp { op, left, right } => {
+            if *op == DslIntBinOp::Add && is_string_concat_operands(left, right, layout, dsl_ctx)? {
+                if !value_descriptor_assignable_to("Ljava/lang/String;", expected_type) {
+                    return Err(format!("string concat cannot be passed as {}", expected_type));
+                }
+                return emit_string_concat_value(ir, value, expected_type, temp_reg, layout, dsl_ctx);
+            }
             if expected_type != "I" {
                 return Err(format!("int expression cannot be passed as {}", expected_type));
             }
@@ -999,6 +1023,21 @@ fn emit_load_value(
 
 fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
+}
+
+fn descriptor_is_string(desc: Option<&str>) -> bool {
+    desc == Some("Ljava/lang/String;")
+}
+
+fn is_string_concat_operands(
+    left: &DslValue,
+    right: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<bool, String> {
+    let left_desc = infer_value_descriptor(left, layout, dsl_ctx)?;
+    let right_desc = infer_value_descriptor(right, layout, dsl_ctx)?;
+    Ok(descriptor_is_string(left_desc.as_deref()) || descriptor_is_string(right_desc.as_deref()))
 }
 
 fn emit_ternary_value(
@@ -1195,6 +1234,112 @@ fn emit_int_binop_value(
     emit_int_binop_expr(ir, op, left, right, dst, 0, layout, dsl_ctx)
 }
 
+fn emit_string_concat_value(
+    ir: &mut DexIrBuilder,
+    value: &DslValue,
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    if !return_is_object(expected_type) {
+        return Err(format!("string concat cannot be passed as {}", expected_type));
+    }
+    let string_desc = "Ljava/lang/String;".to_string();
+    let builder_desc = "Ljava/lang/StringBuilder;".to_string();
+    let builder_ctor = MethodRef::new(builder_desc.clone(), "<init>", "V", Vec::new());
+    let builder_reg = REG_TMP1;
+
+    ir.new_instance(builder_reg, builder_desc.clone());
+    emit_invoke_with_values(
+        ir,
+        ManagedInvokeKind::Direct,
+        builder_ctor,
+        Some((builder_reg, builder_desc.as_str())),
+        &[],
+        &[],
+        layout,
+        dsl_ctx,
+    )?;
+
+    let mut operands = Vec::new();
+    collect_string_concat_operands(value, layout, dsl_ctx, &mut operands)?;
+    for operand in operands {
+        let operand_desc = infer_value_descriptor(operand, layout, dsl_ctx)?;
+        let append_param = string_builder_append_param(operand_desc.as_deref())?;
+        let append = MethodRef::new(
+            builder_desc.clone(),
+            "append",
+            builder_desc.clone(),
+            vec![append_param.clone()],
+        );
+        let args = [operand.clone()];
+        emit_invoke_with_values(
+            ir,
+            ManagedInvokeKind::Virtual,
+            append,
+            Some((builder_reg, builder_desc.as_str())),
+            &[append_param],
+            &args,
+            layout,
+            dsl_ctx,
+        )?;
+        ir.move_result_object(builder_reg);
+    }
+
+    let to_string = MethodRef::new(builder_desc.clone(), "toString", string_desc, Vec::new());
+    emit_invoke_with_values(
+        ir,
+        ManagedInvokeKind::Virtual,
+        to_string,
+        Some((builder_reg, builder_desc.as_str())),
+        &[],
+        &[],
+        layout,
+        dsl_ctx,
+    )?;
+    ir.move_result_object(dst);
+    Ok(dst)
+}
+
+fn collect_string_concat_operands<'a>(
+    value: &'a DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+    out: &mut Vec<&'a DslValue>,
+) -> Result<(), String> {
+    if let DslValue::IntBinOp {
+        op: DslIntBinOp::Add,
+        left,
+        right,
+    } = value
+    {
+        if is_string_concat_operands(left, right, layout, dsl_ctx)? {
+            collect_string_concat_operands(left, layout, dsl_ctx, out)?;
+            collect_string_concat_operands(right, layout, dsl_ctx, out)?;
+            return Ok(());
+        }
+    }
+    out.push(value);
+    Ok(())
+}
+
+fn string_builder_append_param(desc: Option<&str>) -> Result<String, String> {
+    let param = match desc {
+        None | Some("Ljava/lang/String;") => "Ljava/lang/String;",
+        Some("Z") => "Z",
+        Some("C") => "C",
+        Some("I") => "I",
+        Some("F") => "F",
+        Some("J") => "J",
+        Some("D") => "D",
+        Some(desc) if return_is_object(desc) => "Ljava/lang/Object;",
+        Some("B" | "S") => "I",
+        Some(other) => return Err(format!("string concat does not support operand type {}", other)),
+    };
+    Ok(param.to_string())
+}
+
 fn emit_int_expr_value(
     ir: &mut DexIrBuilder,
     value: &DslValue,
@@ -1362,7 +1507,14 @@ fn infer_value_descriptor(
     match value {
         DslValue::Target(target) => resolve_target_descriptor(target, layout, dsl_ctx).map(Some),
         DslValue::String(_) => Ok(Some("Ljava/lang/String;".to_string())),
-        DslValue::Int(_) | DslValue::IntBinOp { .. } | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
+        DslValue::Int(_) | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
+        DslValue::IntBinOp { op, left, right } => {
+            if *op == DslIntBinOp::Add && is_string_concat_operands(left, right, layout, dsl_ctx)? {
+                return Ok(Some("Ljava/lang/String;".to_string()));
+            }
+            Ok(Some("I".to_string()))
+        }
+        DslValue::DefaultValue { type_name } => java_class_to_descriptor_or_primitive(type_name).map(Some),
         DslValue::UnaryOp { op, .. } => match op {
             DslUnaryOp::Neg | DslUnaryOp::BitNot => Ok(Some("I".to_string())),
             DslUnaryOp::BoolNot => Ok(Some("Z".to_string())),
@@ -1434,9 +1586,14 @@ fn infer_value_descriptor(
             resolve_field_type(dsl_ctx.env, stmt, *is_static, &class_type).map(Some)
         }
         DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
-        DslValue::ArrayGet { type_name, .. } => match type_name {
+        DslValue::ArrayGet { type_name, array, .. } => match type_name {
             Some(type_name) => java_class_to_descriptor_or_primitive(type_name).map(Some),
-            None => Ok(None),
+            None => {
+                let Some(array_desc) = infer_value_descriptor(array, layout, dsl_ctx)? else {
+                    return Ok(None);
+                };
+                array_component_descriptor(&array_desc).map(Some)
+            }
         },
         DslValue::ArrayLiteral { elements } => infer_array_literal_descriptor(elements, layout, dsl_ctx),
     }
@@ -1448,12 +1605,23 @@ fn infer_array_literal_descriptor(
     dsl_ctx: &DslBuildContext,
 ) -> Result<Option<String>, String> {
     let mut component = None;
+    let mut saw_null_before_type = false;
     for element in elements {
-        component = common_value_descriptor_with_env(
-            component,
-            infer_value_descriptor(element, layout, dsl_ctx)?,
-            dsl_ctx.env,
-        )?;
+        let element_desc = infer_value_descriptor(element, layout, dsl_ctx)?;
+        match (&component, element_desc) {
+            (None, Some(desc)) => {
+                if saw_null_before_type && !return_is_object(&desc) {
+                    return Err(format!("array literal null element cannot be assigned to {}", desc));
+                }
+                component = Some(desc);
+            }
+            (None, None) => {
+                saw_null_before_type = true;
+            }
+            (Some(_), desc) => {
+                component = common_value_descriptor_with_env(component, desc, dsl_ctx.env)?;
+            }
+        }
     }
     let Some(component) = component else {
         return Ok(None);
@@ -2915,7 +3083,14 @@ fn value_max_invoke_depth(value: &DslValue) -> u16 {
         DslValue::UnaryOp { value, .. } | DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => {
             value_max_invoke_depth(value)
         }
-        DslValue::IntBinOp { left, right, .. } => value_max_invoke_depth(left).max(value_max_invoke_depth(right)),
+        DslValue::IntBinOp { op, left, right } => {
+            let nested = value_max_invoke_depth(left).max(value_max_invoke_depth(right));
+            if *op == DslIntBinOp::Add {
+                1 + nested
+            } else {
+                nested
+            }
+        }
         DslValue::Ternary {
             condition,
             then_value,
@@ -2926,7 +3101,12 @@ fn value_max_invoke_depth(value: &DslValue) -> u16 {
         DslValue::FieldGet { stmt, .. } => field_stmt_max_invoke_depth(stmt),
         DslValue::ArrayGet { array, index, .. } => value_max_invoke_depth(array).max(value_max_invoke_depth(index)),
         DslValue::ArrayLiteral { elements } => values_max_invoke_depth(elements),
-        DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => 0,
+        DslValue::Target(_)
+        | DslValue::String(_)
+        | DslValue::Int(_)
+        | DslValue::Bool(_)
+        | DslValue::Null
+        | DslValue::DefaultValue { .. } => 0,
     }
 }
 
@@ -3109,6 +3289,7 @@ fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
         | DslValue::Int(_)
         | DslValue::Bool(_)
         | DslValue::Null
+        | DslValue::DefaultValue { .. }
         | DslValue::FieldGet { .. } => 0,
     }
 }
@@ -3285,7 +3466,12 @@ fn value_array_literal_scratch_count(value: &DslValue) -> u16 {
         DslValue::ArrayGet { array, index, .. } => {
             value_array_literal_scratch_count(array).max(value_array_literal_scratch_count(index))
         }
-        DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => 0,
+        DslValue::Target(_)
+        | DslValue::String(_)
+        | DslValue::Int(_)
+        | DslValue::Bool(_)
+        | DslValue::Null
+        | DslValue::DefaultValue { .. } => 0,
     }
 }
 
@@ -3489,7 +3675,14 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         }
         DslValue::OrigCall(args) => orig_value_max_invoke_words(args),
         DslValue::ArrayLength(value) => value_max_invoke_words(value),
-        DslValue::IntBinOp { left, right, .. } => Ok(value_max_invoke_words(left)?.max(value_max_invoke_words(right)?)),
+        DslValue::IntBinOp { op, left, right } => {
+            let nested = value_max_invoke_words(left)?.max(value_max_invoke_words(right)?);
+            if *op == DslIntBinOp::Add {
+                Ok(nested.max(2))
+            } else {
+                Ok(nested)
+            }
+        }
         DslValue::UnaryOp { value, .. } => value_max_invoke_words(value),
         DslValue::Ternary {
             condition,
@@ -3510,7 +3703,8 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         | DslValue::String(_)
         | DslValue::Int(_)
         | DslValue::Bool(_)
-        | DslValue::Null => Ok(0),
+        | DslValue::Null
+        | DslValue::DefaultValue { .. } => Ok(0),
     }
 }
 
@@ -3700,7 +3894,12 @@ fn value_uses_orig(value: &DslValue) -> bool {
         DslValue::FieldGet { stmt, .. } => field_stmt_uses_orig(stmt),
         DslValue::ArrayGet { array, index, .. } => value_uses_orig(array) || value_uses_orig(index),
         DslValue::ArrayLiteral { elements } => elements.iter().any(value_uses_orig),
-        DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => false,
+        DslValue::Target(_)
+        | DslValue::String(_)
+        | DslValue::Int(_)
+        | DslValue::Bool(_)
+        | DslValue::Null
+        | DslValue::DefaultValue { .. } => false,
     }
 }
 

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::dsl::{
-    DslCallKind, DslCallStmt, DslCatch, DslCondition, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget,
-    DslUnaryOp, DslValue,
+    DslCallKind, DslCallStmt, DslCatch, DslCondition, DslFieldStmt, DslIntBinOp, DslOrigArgs, DslProgram, DslStmt,
+    DslTarget, DslUnaryOp, DslValue,
 };
 use super::{
     array_component_descriptor, common_value_descriptor_with_env, java_class_to_descriptor,
@@ -55,6 +55,10 @@ fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
 
 fn value_descriptor_assignable_to_strict(env: JniEnv, src: &str, dst: &str) -> bool {
     src == dst || object_assignability_score(env, src, dst).is_some()
+}
+
+fn descriptor_is_string(desc: Option<&str>) -> bool {
+    desc == Some("Ljava/lang/String;")
 }
 
 fn nonnull_key_for_value(value: &DslValue) -> Option<DslTargetKey> {
@@ -142,6 +146,12 @@ impl DslSemanticContext {
         }
     }
 
+    fn is_string_concat_operands(&self, left: &DslValue, right: &DslValue) -> Result<bool, String> {
+        let left_desc = self.infer_value_descriptor(left)?;
+        let right_desc = self.infer_value_descriptor(right)?;
+        Ok(descriptor_is_string(left_desc.as_deref()) || descriptor_is_string(right_desc.as_deref()))
+    }
+
     fn resolve_target_descriptor(&self, target: &DslTarget) -> Result<String, String> {
         if let Some(key) = dsl_target_key(target) {
             if let Some(Some(desc)) = self.target_narrow_types.get(&key) {
@@ -212,7 +222,18 @@ impl DslSemanticContext {
         match value {
             DslValue::Target(target) => self.resolve_target_descriptor(target).map(Some),
             DslValue::String(_) => Ok(Some("Ljava/lang/String;".to_string())),
-            DslValue::Int(_) | DslValue::IntBinOp { .. } | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
+            DslValue::Int(_) | DslValue::ArrayLength(_) => Ok(Some("I".to_string())),
+            DslValue::IntBinOp { op, left, right } => {
+                if *op == DslIntBinOp::Add {
+                    let left_desc = self.infer_value_descriptor(left)?;
+                    let right_desc = self.infer_value_descriptor(right)?;
+                    if descriptor_is_string(left_desc.as_deref()) || descriptor_is_string(right_desc.as_deref()) {
+                        return Ok(Some("Ljava/lang/String;".to_string()));
+                    }
+                }
+                Ok(Some("I".to_string()))
+            }
+            DslValue::DefaultValue { type_name } => java_class_to_descriptor_or_primitive(type_name).map(Some),
             DslValue::UnaryOp { op, .. } => match op {
                 DslUnaryOp::Neg | DslUnaryOp::BitNot => Ok(Some("I".to_string())),
                 DslUnaryOp::BoolNot => Ok(Some("Z".to_string())),
@@ -269,8 +290,23 @@ impl DslSemanticContext {
 
     fn infer_array_literal_descriptor(&self, elements: &[DslValue]) -> Result<Option<String>, String> {
         let mut component = None;
+        let mut saw_null_before_type = false;
         for element in elements {
-            component = common_value_descriptor_with_env(component, self.infer_value_descriptor(element)?, self.env)?;
+            let element_desc = self.infer_value_descriptor(element)?;
+            match (&component, element_desc) {
+                (None, Some(desc)) => {
+                    if saw_null_before_type && !return_is_object(&desc) {
+                        return Err(format!("array literal null element cannot be assigned to {}", desc));
+                    }
+                    component = Some(desc);
+                }
+                (None, None) => {
+                    saw_null_before_type = true;
+                }
+                (Some(_), desc) => {
+                    component = common_value_descriptor_with_env(component, desc, self.env)?;
+                }
+            }
         }
         let Some(component) = component else {
             return Ok(None);
@@ -328,6 +364,15 @@ impl DslSemanticContext {
                 self.resolve_target_descriptor(target)?;
             }
             DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => {}
+            DslValue::DefaultValue { type_name } => {
+                let desc = java_class_to_descriptor_or_primitive(type_name)?;
+                if desc == "V" {
+                    return Err("default local value cannot have void type".to_string());
+                }
+                if matches!(desc.as_str(), "J" | "D") {
+                    return Err(format!("default local value for {} is not supported yet", desc));
+                }
+            }
             DslValue::UnaryOp { op, value } => {
                 self.validate_value_inner(value, require_nonnull_receiver)?;
                 let Some(desc) = self.infer_value_descriptor(value)? else {
@@ -346,9 +391,24 @@ impl DslSemanticContext {
             DslValue::ArrayLength(value) => {
                 self.validate_value_inner(value, require_nonnull_receiver)?;
             }
-            DslValue::IntBinOp { left, right, .. } => {
+            DslValue::IntBinOp { op, left, right } => {
                 self.validate_value_inner(left, require_nonnull_receiver)?;
                 self.validate_value_inner(right, require_nonnull_receiver)?;
+                if *op == DslIntBinOp::Add && self.is_string_concat_operands(left, right)? {
+                    return Ok(());
+                }
+                let Some(left_desc) = self.infer_value_descriptor(left)? else {
+                    return Err("int binary expression requires int, got null/void".to_string());
+                };
+                let Some(right_desc) = self.infer_value_descriptor(right)? else {
+                    return Err("int binary expression requires int, got null/void".to_string());
+                };
+                if left_desc != "I" || right_desc != "I" {
+                    return Err(format!(
+                        "int binary expression requires int operands, got {} and {}",
+                        left_desc, right_desc
+                    ));
+                }
             }
             DslValue::Ternary {
                 condition,
