@@ -9,6 +9,7 @@ mod cursor;
 mod declaration;
 mod lexer;
 mod member;
+mod member_args;
 use lexer::TokenKind as DslTokenKind;
 mod operators;
 mod parser;
