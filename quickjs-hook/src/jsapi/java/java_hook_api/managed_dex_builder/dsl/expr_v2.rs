@@ -187,6 +187,27 @@ fn try_parse_v2_static_member_primary(
         stream.restore(mark);
         return Ok(None);
     }
+    if parts.last().map(|part| part.as_str()) == Some("overload") && parts.len() >= 3 {
+        let method_name = parts[parts.len() - 2].clone();
+        let class_parts = &parts[..parts.len() - 2];
+        if !class_parts.iter().any(|part| looks_like_static_class_name(part)) {
+            stream.restore(mark);
+            return Ok(None);
+        }
+        let overload_args = parse_v2_overload_selector_args(stream)?;
+        let args = parse_v2_overload_call_args(stream, local_scopes)?;
+        let sig = resolve_v2_static_overload_sig(stream, &overload_args)?;
+        return Ok(Some(DslValue::Call(DslCallStmt {
+            kind: DslCallKind::Static,
+            target: None,
+            receiver: None,
+            null_safe: false,
+            class_name: Some(class_parts.join(".")),
+            method_name,
+            sig,
+            args,
+        })));
+    }
     let member_name = parts.pop().unwrap();
     let class_name = parts.join(".");
     if stream.consume_char('(') {
@@ -298,14 +319,34 @@ fn parse_v2_member_postfix(
     }
 
     let mut call_kind = DslCallKind::Virtual;
-    if stream.peek_char('.') {
-        if !stream.consume_char('.') || !stream.consume_ident("interface") {
+    let mut wants_overload = false;
+    if stream.consume_char('.') {
+        if stream.consume_ident("interface") {
+            call_kind = DslCallKind::Interface;
+            if stream.consume_char('.') {
+                if !stream.consume_ident("overload") {
+                    return Err(stream.err("expected overload after interface member access"));
+                }
+                wants_overload = true;
+            }
+        } else if stream.consume_ident("overload") {
+            wants_overload = true;
+        } else {
             return Err(stream.err("unsupported chained member access in expression v2"));
         }
-        call_kind = DslCallKind::Interface;
     }
-    if stream.peek_char('.') {
-        return Err(stream.err("overload member access is handled by the legacy parser"));
+    if wants_overload {
+        let overload_args = parse_v2_overload_selector_args(stream)?;
+        let args = parse_v2_overload_call_args(stream, local_scopes)?;
+        return build_v2_receiver_overload_call(
+            stream,
+            receiver,
+            null_safe,
+            member_name,
+            call_kind,
+            overload_args,
+            args,
+        );
     }
     if !stream.peek_char('(') {
         return build_v2_receiver_field(stream, receiver, member_name, call_kind);
@@ -341,6 +382,66 @@ fn parse_v2_direct_call_args(
             return Ok(args);
         }
     }
+}
+
+fn parse_v2_overload_selector_args(stream: &mut DslTokenStream<'_>) -> Result<Vec<String>, String> {
+    if !stream.consume_char('(') {
+        return Err(stream.err("expected '('"));
+    }
+    let mut overload_args = Vec::new();
+    if !stream.peek_char(')') {
+        loop {
+            overload_args.push(stream.parse_string()?);
+            if !stream.consume_char(',') {
+                break;
+            }
+        }
+    }
+    if !stream.consume_char(')') {
+        return Err(stream.err("expected ')'"));
+    }
+    Ok(overload_args)
+}
+
+fn parse_v2_overload_call_args(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<Vec<DslValue>, String> {
+    if !stream.consume_char('(') {
+        return Err(stream.err("expected '('"));
+    }
+    let args = parse_v2_value_arg_list_until_close(stream, local_scopes)?;
+    if !stream.consume_char(')') {
+        return Err(stream.err("expected ')'"));
+    }
+    Ok(args)
+}
+
+fn build_v2_receiver_overload_call(
+    stream: &DslTokenStream<'_>,
+    receiver: DslValue,
+    null_safe: bool,
+    method_name: String,
+    kind: DslCallKind,
+    overload_args: Vec<String>,
+    args: Vec<DslValue>,
+) -> Result<DslValue, String> {
+    let (target, receiver) = split_simple_target_receiver(receiver);
+    let (class_name, sig) = if let Some(target) = target.as_ref() {
+        resolve_v2_target_overload_sig(stream, target, kind, &overload_args)?
+    } else {
+        resolve_v2_postfix_overload_sig(stream, kind, &overload_args)?
+    };
+    Ok(DslValue::Call(DslCallStmt {
+        kind,
+        target,
+        receiver: receiver.map(Box::new),
+        null_safe,
+        class_name,
+        method_name,
+        sig,
+        args,
+    }))
 }
 
 fn build_v2_receiver_call(
@@ -391,6 +492,89 @@ fn split_simple_target_receiver(value: DslValue) -> (Option<DslTarget>, Option<D
         DslValue::Target(target) => (Some(target), None),
         value => (None, Some(value)),
     }
+}
+
+fn resolve_v2_postfix_overload_sig(
+    stream: &DslTokenStream<'_>,
+    call_kind: DslCallKind,
+    overload_args: &[String],
+) -> Result<(Option<String>, String), String> {
+    if call_kind == DslCallKind::Interface {
+        return resolve_v2_interface_overload_sig(stream, overload_args);
+    }
+    if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+        if overload_args.len() != 1 {
+            return Err(stream.err("full-signature overload expects overload(\"sig\")"));
+        }
+        return Ok((None, overload_args[0].clone()));
+    }
+    if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
+        return Ok((Some(overload_args[0].clone()), overload_args[1].clone()));
+    }
+    Ok((None, overload_params_sig_v2(overload_args)?))
+}
+
+fn resolve_v2_target_overload_sig(
+    stream: &DslTokenStream<'_>,
+    target: &DslTarget,
+    call_kind: DslCallKind,
+    overload_args: &[String],
+) -> Result<(Option<String>, String), String> {
+    if call_kind == DslCallKind::Interface {
+        return resolve_v2_interface_overload_sig(stream, overload_args);
+    }
+    if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+        return Ok((None, overload_args[0].clone()));
+    }
+    if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
+        return Ok((Some(overload_args[0].clone()), overload_args[1].clone()));
+    }
+    let first_is_explicit_class = matches!(target, DslTarget::Last | DslTarget::Result)
+        && overload_args.len() >= 2
+        && overload_args[0].contains('.');
+    if first_is_explicit_class {
+        return Ok((
+            Some(overload_args[0].clone()),
+            overload_params_sig_v2(&overload_args[1..])?,
+        ));
+    }
+    Ok((None, overload_params_sig_v2(overload_args)?))
+}
+
+fn resolve_v2_static_overload_sig(stream: &DslTokenStream<'_>, overload_args: &[String]) -> Result<String, String> {
+    if overload_args.first().map(|arg| arg.starts_with('(')).unwrap_or(false) {
+        if overload_args.len() != 1 {
+            return Err(stream.err("static full-signature overload expects overload(\"sig\")"));
+        }
+        return Ok(overload_args[0].clone());
+    }
+    overload_params_sig_v2(overload_args)
+}
+
+fn resolve_v2_interface_overload_sig(
+    stream: &DslTokenStream<'_>,
+    overload_args: &[String],
+) -> Result<(Option<String>, String), String> {
+    let Some(class_name) = overload_args.first() else {
+        return Err(stream.err("interface overload expects overload(\"InterfaceClass\", ...)"));
+    };
+    if class_name.starts_with('(') {
+        return Err(stream.err("interface overload expects overload(\"InterfaceClass\", ...)"));
+    }
+    let params = if overload_args.len() >= 2 && overload_args[1].starts_with('(') {
+        overload_args[1].clone()
+    } else {
+        overload_params_sig_v2(&overload_args[1..])?
+    };
+    Ok((Some(class_name.clone()), params))
+}
+
+fn overload_params_sig_v2(overload_args: &[String]) -> Result<String, String> {
+    let param_types = overload_args
+        .iter()
+        .map(|arg| java_class_to_descriptor_or_primitive(arg))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(build_params_sig(&param_types))
 }
 
 fn peek_v2_int_binary_op(stream: &DslTokenStream<'_>) -> Option<(DslIntBinOp, u8)> {
