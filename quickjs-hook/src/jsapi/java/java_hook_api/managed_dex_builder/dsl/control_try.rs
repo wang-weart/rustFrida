@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> DslParser<'a> {
-    pub(super) fn parse_js_try_catch_statement(&mut self) -> Result<DslStmt, String> {
+    pub(super) fn parse_try_catch_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("try")?;
         let try_stmts = self.parse_block()?;
         let mut catches = Vec::new();

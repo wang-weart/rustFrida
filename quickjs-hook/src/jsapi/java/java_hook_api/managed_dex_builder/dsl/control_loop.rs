@@ -1,36 +1,36 @@
 use super::*;
 
 impl<'a> DslParser<'a> {
-    pub(super) fn parse_js_while_statement(&mut self) -> Result<DslStmt, String> {
+    pub(super) fn parse_while_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("while")?;
         self.skip_ws();
         self.expect_char('(')?;
-        let condition = self.parse_js_if_condition()?;
+        let condition = self.parse_if_condition()?;
         self.expect_char(')')?;
         let body_stmts = self.parse_statement_body()?;
         Ok(DslStmt::While { condition, body_stmts })
     }
 
-    pub(super) fn parse_js_do_while_statement(&mut self) -> Result<DslStmt, String> {
+    pub(super) fn parse_do_while_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("do")?;
         let body_stmts = self.parse_statement_body()?;
         self.skip_ws();
         self.expect_ident("while")?;
         self.skip_ws();
         self.expect_char('(')?;
-        let condition = self.parse_js_if_condition()?;
+        let condition = self.parse_if_condition()?;
         self.expect_char(')')?;
         self.skip_ws();
         self.expect_char(';')?;
         Ok(DslStmt::DoWhile { body_stmts, condition })
     }
 
-    pub(super) fn parse_js_for_statement(&mut self) -> Result<DslStmt, String> {
+    pub(super) fn parse_for_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("for")?;
-        self.with_local_scope(|parser| parser.parse_js_for_statement_scoped())
+        self.with_local_scope(|parser| parser.parse_for_statement_scoped())
     }
 
-    fn parse_js_for_statement_scoped(&mut self) -> Result<DslStmt, String> {
+    fn parse_for_statement_scoped(&mut self) -> Result<DslStmt, String> {
         self.skip_ws();
         self.expect_char('(')?;
         let init_stmts = if self.peek() == Some(';') {
@@ -38,7 +38,7 @@ impl<'a> DslParser<'a> {
             Vec::new()
         } else if self.peek_ident("let") {
             self.expect_ident("let")?;
-            self.parse_js_let_declarations_until(';')?
+            self.parse_let_declarations_until(';')?
         } else {
             self.parse_for_header_statement_list(';', false)?
         };
@@ -46,7 +46,7 @@ impl<'a> DslParser<'a> {
         let condition = if self.peek() == Some(';') {
             None
         } else {
-            Some(self.parse_js_if_condition()?)
+            Some(self.parse_if_condition()?)
         };
         self.expect_char(';')?;
         self.skip_ws();
@@ -73,7 +73,7 @@ impl<'a> DslParser<'a> {
                     return Err(self.err("let declarations are only supported in for init"));
                 }
                 self.expect_ident("let")?;
-                stmts.extend(self.parse_js_let_declarations_until(terminator)?);
+                stmts.extend(self.parse_let_declarations_until(terminator)?);
                 break;
             }
             stmts.push(self.parse_for_header_statement()?);
@@ -103,6 +103,7 @@ impl<'a> DslParser<'a> {
             self.skip_ws();
             return Ok(self.local_increment_stmt(name, delta));
         }
+        let name_mark = self.mark();
         let name = self.parse_ident()?;
         self.skip_ws();
         let stmt = if self.peek() == Some('=') {
@@ -126,7 +127,8 @@ impl<'a> DslParser<'a> {
             let name = self.resolve_local_name_or_source(name);
             self.local_increment_stmt(name, delta)
         } else if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
-            let value = self.parse_value_from_ident(name)?;
+            self.restore(name_mark);
+            let value = self.parse_expr_v2()?;
             self.skip_ws();
             if self.peek() == Some('=') {
                 self.expect_char('=')?;

@@ -20,6 +20,10 @@ impl DslValue {
                 ctor_sig,
                 args,
             }),
+            DslValue::NewArray { array_type_name, size } => Some(DslStmt::NewArray {
+                array_type_name,
+                size: *size,
+            }),
             DslValue::FieldGet { stmt, is_static } => Some(DslStmt::FieldRead { stmt: *stmt, is_static }),
             DslValue::Cast { value, class_name } => Some(DslStmt::Cast {
                 value: *value,

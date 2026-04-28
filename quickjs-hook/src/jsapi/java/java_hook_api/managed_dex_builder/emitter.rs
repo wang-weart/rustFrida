@@ -412,9 +412,10 @@ fn collect_value_strings(value: &DslValue, dsl_ctx: &mut DslBuildContext) {
         DslValue::String(value) => {
             dsl_ctx.string_literal_field(value);
         }
-        DslValue::UnaryOp { value, .. } | DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => {
-            collect_value_strings(value, dsl_ctx)
-        }
+        DslValue::UnaryOp { value, .. }
+        | DslValue::Cast { value, .. }
+        | DslValue::ArrayLength(value)
+        | DslValue::NewArray { size: value, .. } => collect_value_strings(value, dsl_ctx),
         DslValue::IntBinOp { left, right, .. }
         | DslValue::ArrayGet {
             array: left,
@@ -961,6 +962,9 @@ fn emit_load_value(
             layout,
             dsl_ctx,
         ),
+        DslValue::NewArray { array_type_name, size } => {
+            emit_new_array_value(ir, array_type_name, size, expected_type, temp_reg, layout, dsl_ctx)
+        }
         DslValue::FieldGet { stmt, is_static } => {
             emit_field_get_value(ir, stmt, *is_static, expected_type, temp_reg, layout, dsl_ctx)
         }
@@ -1418,6 +1422,7 @@ fn infer_value_descriptor(
             }
         }
         DslValue::NewObject { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
+        DslValue::NewArray { array_type_name, .. } => java_class_to_descriptor_or_primitive(array_type_name).map(Some),
         DslValue::FieldGet { stmt, is_static } => {
             let class_type = resolve_member_class_type(
                 stmt.class_name.as_deref(),
@@ -2370,6 +2375,31 @@ fn emit_new_array(
     Ok(())
 }
 
+fn emit_new_array_value(
+    ir: &mut DexIrBuilder,
+    array_type_name: &str,
+    size: &DslValue,
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    let array_type = java_class_to_descriptor_or_primitive(array_type_name)?;
+    if !array_type.starts_with('[') {
+        return Err(format!("newArray requires an array type, got '{}'", array_type_name));
+    }
+    if !value_descriptor_assignable_to(&array_type, expected_type) {
+        return Err(format!(
+            "new array expression type {} cannot be passed as {}",
+            array_type, expected_type
+        ));
+    }
+    let size_reg = emit_load_value(ir, size, "I", REG_TMP0, layout, dsl_ctx)?;
+    let size_reg = emit_copy_field_value_if_needed(ir, size_reg, REG_TMP0, ValueKind::Narrow);
+    ir.new_array(dst, size_reg, array_type);
+    Ok(dst)
+}
+
 fn emit_array_length_stmt(
     ir: &mut DexIrBuilder,
     array: &DslValue,
@@ -2880,6 +2910,7 @@ fn value_max_invoke_depth(value: &DslValue) -> u16 {
     match value {
         DslValue::Call(stmt) => call_stmt_max_invoke_depth(stmt),
         DslValue::NewObject { args, .. } => 1 + values_max_invoke_depth(args),
+        DslValue::NewArray { size, .. } => value_max_invoke_depth(size),
         DslValue::OrigCall(args) => orig_args_max_invoke_depth(args),
         DslValue::UnaryOp { value, .. } | DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => {
             value_max_invoke_depth(value)
@@ -3054,6 +3085,7 @@ fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
         DslValue::UnaryOp { value, .. } => value_int_expr_scratch_count(value),
         DslValue::OrigCall(args) => orig_args_int_expr_scratch_count(args),
         DslValue::NewObject { args, .. } => values_int_expr_scratch_count(args),
+        DslValue::NewArray { size, .. } => value_int_expr_scratch_count(size),
         DslValue::Call(stmt) => stmt
             .receiver
             .as_ref()
@@ -3248,6 +3280,7 @@ fn value_array_literal_scratch_count(value: &DslValue) -> u16 {
         DslValue::OrigCall(args) => orig_args_array_literal_scratch_count(args),
         DslValue::Call(stmt) => call_stmt_array_literal_scratch_count(stmt),
         DslValue::NewObject { args, .. } => values_array_literal_scratch_count(args),
+        DslValue::NewArray { size, .. } => value_array_literal_scratch_count(size),
         DslValue::FieldGet { stmt, .. } => field_stmt_array_literal_scratch_count(stmt),
         DslValue::ArrayGet { array, index, .. } => {
             value_array_literal_scratch_count(array).max(value_array_literal_scratch_count(index))
@@ -3443,6 +3476,7 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
             }
             Ok(words)
         }
+        DslValue::NewArray { size, .. } => value_max_invoke_words(size),
         DslValue::Call(stmt) => {
             let mut words = call_stmt_max_direct_words(stmt)?;
             for arg in &stmt.args {
@@ -3662,6 +3696,7 @@ fn value_uses_orig(value: &DslValue) -> bool {
         } => condition_uses_orig(condition) || value_uses_orig(then_value) || value_uses_orig(else_value),
         DslValue::Call(stmt) => call_stmt_uses_orig(stmt),
         DslValue::NewObject { args, .. } => args.iter().any(value_uses_orig),
+        DslValue::NewArray { size, .. } => value_uses_orig(size),
         DslValue::FieldGet { stmt, .. } => field_stmt_uses_orig(stmt),
         DslValue::ArrayGet { array, index, .. } => value_uses_orig(array) || value_uses_orig(index),
         DslValue::ArrayLiteral { elements } => elements.iter().any(value_uses_orig),

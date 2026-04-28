@@ -16,15 +16,9 @@ impl<'a> DslParser<'a> {
         Ok(self.local_increment_stmt(name, delta))
     }
 
-    pub(super) fn parse_named_statement_tail(&mut self, name: String) -> Result<DslStmt, String> {
+    pub(super) fn parse_named_statement_tail(&mut self, name: String, name_mark: DslMark) -> Result<DslStmt, String> {
         if name == "let" && self.peek() != Some('(') {
-            return self.parse_js_let_statement();
-        }
-        if name == "new" && self.peek() != Some('(') {
-            let stmt = self.parse_js_new_statement()?;
-            self.skip_ws();
-            self.expect_char(';')?;
-            return Ok(stmt);
+            return self.parse_let_statement();
         }
         if name == "count" && self.peek() == Some('(') {
             return self.parse_count_statement();
@@ -58,8 +52,9 @@ impl<'a> DslParser<'a> {
             let name = self.resolve_local_name_or_source(name);
             return Ok(self.local_increment_stmt(name, delta));
         }
-        if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
-            let value = self.parse_value_from_ident(name)?;
+        if name == "new" || self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
+            self.restore(name_mark);
+            let value = self.parse_expr_v2()?;
             return self.parse_value_statement_tail(
                 value,
                 "only method calls and field reads can be used as expression statements",
@@ -79,7 +74,11 @@ impl<'a> DslParser<'a> {
         Ok(DslStmt::Count { name: counter_name })
     }
 
-    fn parse_value_statement_tail(&mut self, value: DslValue, expression_error: &str) -> Result<DslStmt, String> {
+    pub(super) fn parse_value_statement_tail(
+        &mut self,
+        value: DslValue,
+        expression_error: &str,
+    ) -> Result<DslStmt, String> {
         self.skip_ws();
         if self.peek() == Some('=') {
             self.expect_char('=')?;

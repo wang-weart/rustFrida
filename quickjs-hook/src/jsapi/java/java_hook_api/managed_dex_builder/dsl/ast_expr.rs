@@ -28,6 +28,10 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslValue {
         ctor_sig: Option<String>,
         args: Vec<DslValue>,
     },
+    NewArray {
+        array_type_name: String,
+        size: Box<DslValue>,
+    },
     FieldGet {
         stmt: Box<DslFieldStmt>,
         is_static: bool,

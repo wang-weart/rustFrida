@@ -20,16 +20,25 @@ const V2_INT_BINARY_CHAR_OPS: &[(char, DslIntBinOp, u8)] = &[
 ];
 
 impl<'a> DslParser<'a> {
-    pub(super) fn try_parse_expr_v2(&mut self) -> Option<DslValue> {
+    pub(super) fn parse_expr_v2(&mut self) -> Result<DslValue, String> {
         let start = self.pos;
         let mut stream = DslTokenStream::new(self.input, &self.tokens, self.pos);
-        let value = parse_v2_int_binary_expr(&mut stream, &self.local_scopes, 0).ok()?;
+        if !can_start_v2_expr(&stream) {
+            return Err(stream.err("expected expression"));
+        }
+        let value = match parse_v2_int_binary_expr(&mut stream, &self.local_scopes, 0) {
+            Ok(value) => value,
+            Err(err) => {
+                self.pos = start;
+                return Err(err);
+            }
+        };
         if has_v2_unsupported_trailing_token(&stream) {
             self.pos = start;
-            return None;
+            return Err(stream.err("unsupported expression tail"));
         }
         self.pos = stream.pos();
-        Some(value)
+        Ok(value)
     }
 }
 
@@ -128,6 +137,7 @@ fn parse_v2_primary_expr(
             stream.advance();
             Ok(DslValue::Null)
         }
+        Some(DslTokenKind::Ident(value)) if value == "new" => parse_v2_new_expr(stream, local_scopes),
         Some(DslTokenKind::Ident(value)) if value == "orig" => {
             stream.advance();
             if stream.peek_char('(') {
@@ -159,8 +169,40 @@ fn parse_v2_primary_expr(
             Ok(value)
         }
         Some(DslTokenKind::Symbol('[')) => parse_v2_array_literal(stream, local_scopes),
-        _ => Err(stream.err("not a constant expression")),
+        _ => Err(stream.err("expected expression")),
     }
+}
+
+fn parse_v2_new_expr(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<DslValue, String> {
+    if !stream.consume_ident("new") {
+        return Err(stream.err("expected new expression"));
+    }
+    let class_name = parse_type_name_v2(stream)?;
+    if !stream.consume_char('(') {
+        return Err(stream.err("expected '('"));
+    }
+    if class_name.ends_with("[]") {
+        let size = parse_v2_int_binary_expr(stream, local_scopes, 0)?;
+        if !stream.consume_char(')') {
+            return Err(stream.err("expected ')'"));
+        }
+        return Ok(DslValue::NewArray {
+            array_type_name: class_name,
+            size: Box::new(size),
+        });
+    }
+    let (ctor_sig, args) = parse_v2_new_constructor_args(stream, local_scopes)?;
+    if !stream.consume_char(')') {
+        return Err(stream.err("expected ')'"));
+    }
+    Ok(DslValue::NewObject {
+        class_name,
+        ctor_sig,
+        args,
+    })
 }
 
 fn try_parse_v2_static_member_primary(
@@ -406,6 +448,7 @@ fn parse_v2_member_postfix(
 
     let mut call_kind = DslCallKind::Virtual;
     let mut wants_overload = false;
+    let selector_mark = stream.mark();
     if stream.consume_char('.') {
         if stream.consume_ident("interface") {
             call_kind = DslCallKind::Interface;
@@ -418,7 +461,7 @@ fn parse_v2_member_postfix(
         } else if stream.consume_ident("overload") {
             wants_overload = true;
         } else {
-            return Err(stream.err("unsupported chained member access in expression v2"));
+            stream.restore(selector_mark);
         }
     }
     if wants_overload {
@@ -460,7 +503,7 @@ fn parse_v2_member_call_args(
             if !stream.consume_char(')') {
                 return Err(stream.err("expected ')'"));
             }
-            return Ok(ParsedCallArgs::LegacyCall {
+            return Ok(ParsedCallArgs::ExplicitSignatureCall {
                 class_name: None,
                 sig: first,
                 args,
@@ -476,7 +519,7 @@ fn parse_v2_member_call_args(
                     if !stream.consume_char(')') {
                         return Err(stream.err("expected ')'"));
                     }
-                    return Ok(ParsedCallArgs::LegacyCall {
+                    return Ok(ParsedCallArgs::ExplicitSignatureCall {
                         class_name: Some(first),
                         sig: second,
                         args,
@@ -487,10 +530,7 @@ fn parse_v2_member_call_args(
         }
         if allow_field && stream.peek_char(')') && looks_like_type_name(&first) {
             stream.consume_char(')');
-            return Ok(ParsedCallArgs::Field {
-                class_name: None,
-                type_name: first,
-            });
+            return Ok(ParsedCallArgs::Field { type_name: first });
         }
 
         let mut args = vec![DslValue::String(first)];
@@ -612,7 +652,7 @@ fn build_v2_receiver_call(
                 args,
             }))
         }
-        ParsedCallArgs::LegacyCall { class_name, sig, args } => {
+        ParsedCallArgs::ExplicitSignatureCall { class_name, sig, args } => {
             let (target, receiver) = split_simple_target_receiver(receiver);
             Ok(DslValue::Call(DslCallStmt {
                 kind,
@@ -625,9 +665,7 @@ fn build_v2_receiver_call(
                 args,
             }))
         }
-        ParsedCallArgs::Field { type_name, .. } => {
-            build_v2_receiver_field(stream, receiver, method_name, kind, type_name)
-        }
+        ParsedCallArgs::Field { type_name } => build_v2_receiver_field(stream, receiver, method_name, kind, type_name),
     }
 }
 
@@ -674,7 +712,7 @@ fn build_v2_static_member_value(class_name: String, member_name: String, parsed_
             sig: String::new(),
             args,
         }),
-        ParsedCallArgs::LegacyCall { sig, args, .. } => DslValue::Call(DslCallStmt {
+        ParsedCallArgs::ExplicitSignatureCall { sig, args, .. } => DslValue::Call(DslCallStmt {
             kind: DslCallKind::Static,
             target: None,
             receiver: None,
@@ -684,7 +722,7 @@ fn build_v2_static_member_value(class_name: String, member_name: String, parsed_
             sig,
             args,
         }),
-        ParsedCallArgs::Field { type_name, .. } => DslValue::FieldGet {
+        ParsedCallArgs::Field { type_name } => DslValue::FieldGet {
             stmt: Box::new(DslFieldStmt {
                 target: None,
                 receiver: None,
@@ -848,4 +886,12 @@ fn parse_type_name_v2(stream: &mut DslTokenStream<'_>) -> Result<String, String>
 
 fn has_v2_unsupported_trailing_token(stream: &DslTokenStream<'_>) -> bool {
     stream.peek_char('.') || stream.peek_char('(') || stream.peek_op("?.")
+}
+
+fn can_start_v2_expr(stream: &DslTokenStream<'_>) -> bool {
+    matches!(
+        stream.current_kind(),
+        Some(DslTokenKind::Number(_) | DslTokenKind::Ident(_) | DslTokenKind::String(_))
+            | Some(DslTokenKind::Symbol('(' | '[' | '-' | '~' | '!'))
+    )
 }

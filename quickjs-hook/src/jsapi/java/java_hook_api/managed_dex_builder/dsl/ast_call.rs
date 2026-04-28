@@ -27,13 +27,12 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslCallKind 
 
 pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum ParsedCallArgs {
     Direct(Vec<DslValue>),
-    LegacyCall {
+    ExplicitSignatureCall {
         class_name: Option<String>,
         sig: String,
         args: Vec<DslValue>,
     },
     Field {
-        class_name: Option<String>,
         type_name: String,
     },
 }

@@ -36,11 +36,4 @@ impl<'a> DslParser<'a> {
     pub(super) fn resolve_local_name_or_source(&self, source_name: String) -> String {
         self.resolve_local(&source_name).unwrap_or(source_name)
     }
-
-    pub(super) fn scoped_target_name(&self, name: &str) -> Option<DslTarget> {
-        match parse_target_name(name) {
-            Some(DslTarget::Local(local)) => Some(DslTarget::Local(self.resolve_local(&local).unwrap_or(local))),
-            other => other,
-        }
-    }
 }

@@ -94,10 +94,6 @@ impl<'a> DslParser<'a> {
         matches!(self.current_kind(), Some(DslTokenKind::String(_)))
     }
 
-    pub(super) fn peek_number(&self) -> bool {
-        matches!(self.current_kind(), Some(DslTokenKind::Number(_)))
-    }
-
     pub(super) fn peek_op(&self, expected: &str) -> bool {
         matches!(self.current_kind(), Some(DslTokenKind::Op(value)) if *value == expected)
     }

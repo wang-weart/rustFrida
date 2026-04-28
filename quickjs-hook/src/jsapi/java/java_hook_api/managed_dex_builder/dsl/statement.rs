@@ -65,22 +65,22 @@ impl<'a> DslParser<'a> {
             return Ok(DslStmt::Throw { value });
         }
         if self.peek_ident("if") {
-            return self.parse_js_if_statement();
+            return self.parse_if_statement();
         }
         if self.peek_ident("while") {
-            return self.parse_js_while_statement();
+            return self.parse_while_statement();
         }
         if self.peek_ident("do") {
-            return self.parse_js_do_while_statement();
+            return self.parse_do_while_statement();
         }
         if self.peek_ident("for") {
-            return self.parse_js_for_statement();
+            return self.parse_for_statement();
         }
         if self.peek_ident("switch") {
-            return self.parse_js_switch_statement();
+            return self.parse_switch_statement();
         }
         if self.peek_ident("try") {
-            return self.parse_js_try_catch_statement();
+            return self.parse_try_catch_statement();
         }
         if self.peek_ident("break") {
             self.expect_ident("break")?;
@@ -98,8 +98,9 @@ impl<'a> DslParser<'a> {
             return self.parse_prefix_increment_statement();
         }
 
+        let name_mark = self.mark();
         let name = self.parse_ident()?;
         self.skip_ws();
-        self.parse_named_statement_tail(name)
+        self.parse_named_statement_tail(name, name_mark)
     }
 }

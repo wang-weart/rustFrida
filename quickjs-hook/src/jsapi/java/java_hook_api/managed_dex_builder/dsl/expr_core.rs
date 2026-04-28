@@ -6,12 +6,29 @@ impl<'a> DslParser<'a> {
     }
 
     pub(super) fn parse_non_ternary_value_arg(&mut self) -> Result<DslValue, String> {
-        self.parse_int_binary_expr(0)
+        self.parse_expr_v2()
+    }
+
+    pub(super) fn parse_value_arg_list_until_close(&mut self) -> Result<Vec<DslValue>, String> {
+        let mut args = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                break;
+            }
+            args.push(self.parse_value_arg()?);
+            self.skip_ws();
+            if self.peek() != Some(',') {
+                break;
+            }
+            self.expect_char(',')?;
+        }
+        Ok(args)
     }
 
     fn parse_ternary_expr(&mut self) -> Result<DslValue, String> {
         let checkpoint = self.mark();
-        if let Ok(condition) = self.parse_js_condition() {
+        if let Ok(condition) = self.parse_condition() {
             self.skip_ws();
             if self.peek() == Some('?') {
                 self.expect_char('?')?;
@@ -22,80 +39,6 @@ impl<'a> DslParser<'a> {
             }
         }
         self.restore(checkpoint);
-        self.parse_int_binary_expr(0)
-    }
-
-    fn parse_int_binary_expr(&mut self, min_prec: u8) -> Result<DslValue, String> {
-        if min_prec == 0 {
-            if let Some(value) = self.try_parse_expr_v2() {
-                return Ok(value);
-            }
-        }
-        let mut left = self.parse_value_unary()?;
-        loop {
-            self.skip_ws();
-            let Some((op, prec)) = self.peek_int_binary_op() else {
-                break;
-            };
-            if prec < min_prec {
-                break;
-            }
-            self.consume_int_binary_op(op)?;
-            let right = self.parse_int_binary_expr(prec + 1)?;
-            left = fold_int_binop(op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_value_unary(&mut self) -> Result<DslValue, String> {
-        self.skip_ws();
-        if self.peek() == Some('-') {
-            self.expect_char('-')?;
-            if self.peek_number() {
-                return Ok(DslValue::Int(self.parse_i16_after_sign(true)?));
-            }
-            let value = self.parse_value_unary()?;
-            return Ok(fold_unary_op(DslUnaryOp::Neg, value));
-        }
-        if self.peek() == Some('~') {
-            self.expect_char('~')?;
-            let value = self.parse_value_unary()?;
-            return Ok(fold_unary_op(DslUnaryOp::BitNot, value));
-        }
-        if self.peek() == Some('!') {
-            self.expect_char('!')?;
-            let value = self.parse_value_unary()?;
-            return Ok(fold_unary_op(DslUnaryOp::BoolNot, value));
-        }
-        self.parse_value_primary()
-    }
-
-    fn parse_value_primary(&mut self) -> Result<DslValue, String> {
-        self.skip_ws();
-        let value = if self.peek_string() {
-            DslValue::String(self.parse_string()?)
-        } else if self.peek_number() {
-            DslValue::Int(self.parse_i16()?)
-        } else if self.peek() == Some('(') {
-            self.expect_char('(')?;
-            let value = self.parse_value_arg()?;
-            self.expect_char(')')?;
-            value
-        } else if self.peek() == Some('[') {
-            self.parse_array_literal()?
-        } else {
-            let ident = self.parse_ident()?;
-            if ident == "null" {
-                DslValue::Null
-            } else if ident == "true" {
-                DslValue::Bool(true)
-            } else if ident == "false" {
-                DslValue::Bool(false)
-            } else {
-                self.parse_value_from_ident(ident)?
-            }
-        };
-        self.skip_ws();
-        self.parse_value_postfix(value)
+        self.parse_expr_v2()
     }
 }

@@ -1,7 +1,7 @@
 use super::*;
 
 impl<'a> DslParser<'a> {
-    pub(super) fn parse_js_switch_statement(&mut self) -> Result<DslStmt, String> {
+    pub(super) fn parse_switch_statement(&mut self) -> Result<DslStmt, String> {
         self.expect_ident("switch")?;
         self.skip_ws();
         self.expect_char('(')?;

@@ -249,6 +249,9 @@ impl DslSemanticContext {
                 }
             }
             DslValue::NewObject { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
+            DslValue::NewArray { array_type_name, .. } => {
+                java_class_to_descriptor_or_primitive(array_type_name).map(Some)
+            }
             DslValue::FieldGet { stmt, is_static } => self.resolve_field_descriptor(stmt, *is_static).map(Some),
             DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
             DslValue::ArrayGet { type_name, array, .. } => match type_name {
@@ -440,6 +443,16 @@ impl DslSemanticContext {
                 }
                 for arg in args {
                     self.validate_value_inner(arg, require_nonnull_receiver)?;
+                }
+            }
+            DslValue::NewArray { array_type_name, size } => {
+                let desc = java_class_to_descriptor_or_primitive(array_type_name)?;
+                if !desc.starts_with('[') {
+                    return Err(format!("new array requires an array type, got '{}'", array_type_name));
+                }
+                self.validate_value_inner(size, require_nonnull_receiver)?;
+                if self.infer_value_descriptor(size)?.as_deref() != Some("I") {
+                    return Err("new array size must be int".to_string());
                 }
             }
             DslValue::Call(stmt) => {
