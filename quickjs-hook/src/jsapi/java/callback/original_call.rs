@@ -30,6 +30,27 @@ macro_rules! dispatch_call {
     }};
 }
 
+struct MarshaledJValue {
+    raw: u64,
+    owned_local_ref: bool,
+}
+
+impl MarshaledJValue {
+    fn raw(raw: u64) -> Self {
+        Self {
+            raw,
+            owned_local_ref: false,
+        }
+    }
+
+    fn local(raw: u64) -> Self {
+        Self {
+            raw,
+            owned_local_ref: raw != 0,
+        }
+    }
+}
+
 /// Convert a JS value to a JNI jvalue (u64) based on the parameter type descriptor.
 ///
 /// Handles: primitives (Z/B/C/S/I/J/F/D), String (JS string → NewStringUTF),
@@ -41,78 +62,89 @@ pub(super) unsafe fn marshal_js_to_jvalue(
     val: JSValue,
     type_sig: Option<&str>,
 ) -> u64 {
+    marshal_js_to_jvalue_owned(ctx, env, val, type_sig).raw
+}
+
+unsafe fn marshal_js_to_jvalue_owned(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    val: JSValue,
+    type_sig: Option<&str>,
+) -> MarshaledJValue {
     if val.is_null() || val.is_undefined() {
-        return 0;
+        return MarshaledJValue::raw(0);
     }
 
     let sig = match type_sig {
         Some(s) if !s.is_empty() => s,
         _ => {
             // No type info — try number or bigint
-            return js_value_to_u64_or_zero(ctx, val);
+            return MarshaledJValue::raw(js_value_to_u64_or_zero(ctx, val));
         }
     };
 
     match sig.as_bytes()[0] {
         b'Z' => {
             if let Some(b) = val.to_bool() {
-                b as u64
+                MarshaledJValue::raw(b as u64)
             } else if let Some(n) = val.to_i64(ctx) {
-                (n != 0) as u64
+                MarshaledJValue::raw((n != 0) as u64)
             } else {
-                0
+                MarshaledJValue::raw(0)
             }
         }
         b'B' | b'S' | b'I' => {
             if let Some(n) = val.to_i64(ctx) {
-                n as u64
+                MarshaledJValue::raw(n as u64)
             } else {
-                0
+                MarshaledJValue::raw(0)
             }
         }
         b'C' => {
             // char: JS string (first char) or number
             if let Some(s) = val.to_string(ctx) {
-                s.chars().next().map(|c| c as u64).unwrap_or(0)
+                MarshaledJValue::raw(s.chars().next().map(|c| c as u64).unwrap_or(0))
             } else if let Some(n) = val.to_i64(ctx) {
-                n as u64
+                MarshaledJValue::raw(n as u64)
             } else {
-                0
+                MarshaledJValue::raw(0)
             }
         }
         b'J' => {
-            js_value_to_u64_or_zero(ctx, val)
+            MarshaledJValue::raw(js_value_to_u64_or_zero(ctx, val))
         }
         b'F' => {
             if let Some(f) = val.to_float() {
-                (f as f32).to_bits() as u64
+                MarshaledJValue::raw((f as f32).to_bits() as u64)
             } else {
-                0
+                MarshaledJValue::raw(0)
             }
         }
         b'D' => {
             if let Some(f) = val.to_float() {
-                f.to_bits()
+                MarshaledJValue::raw(f.to_bits())
             } else {
-                0
+                MarshaledJValue::raw(0)
             }
         }
         b'[' => {
             // 数组类型: JS array → Java primitive array (via NewXxxArray + SetXxxArrayRegion)
             // Fallback: JS object with __jptr (已存在的 Java 数组) → 透传
             if ffi::JS_IsArray(ctx, val.raw()) != 0 {
-                return js_array_to_java_primitive_array(ctx, env, val, sig).unwrap_or(0);
+                return MarshaledJValue::local(
+                    js_array_to_java_primitive_array(ctx, env, val, sig).unwrap_or(0),
+                );
             }
             if val.is_object() {
                 let jptr_val = val.get_property(ctx, "__jptr");
                 if !jptr_val.is_undefined() && !jptr_val.is_null() {
                     let result = js_value_to_u64_or_zero(ctx, jptr_val);
                     jptr_val.free(ctx);
-                    return result;
+                    return MarshaledJValue::raw(result);
                 }
                 jptr_val.free(ctx);
             }
-            0
+            MarshaledJValue::raw(0)
         }
         b'L' => {
             // JS string → NewStringUTF for ANY Object type (not just Ljava/lang/String;).
@@ -123,14 +155,14 @@ pub(super) unsafe fn marshal_js_to_jvalue(
                 if let Some(s) = val.to_string(ctx) {
                     let cstr = match CString::new(s) {
                         Ok(c) => c,
-                        Err(_) => return 0,
+                        Err(_) => return MarshaledJValue::raw(0),
                     };
                     let new_str: NewStringUtfFn =
                         jni_fn!(env, NewStringUtfFn, JNI_NEW_STRING_UTF);
                     let jstr = new_str(env, cstr.as_ptr());
-                    return jstr as u64;
+                    return MarshaledJValue::local(jstr as u64);
                 }
-                return 0;
+                return MarshaledJValue::raw(0);
             }
             // JS array → Java Object[] (每个元素按 Ljava/lang/Object; 再 marshal);
             // 只在目标是 Object/Serializable/Comparable 等通用 L 类型时触发, 避免遮蔽
@@ -141,10 +173,10 @@ pub(super) unsafe fn marshal_js_to_jvalue(
                     "Ljava/lang/Object;" | "Ljava/io/Serializable;" | "Ljava/lang/Comparable;"
                 );
                 if is_generic_object {
-                    return js_array_to_java_primitive_array(
+                    return MarshaledJValue::local(js_array_to_java_primitive_array(
                         ctx, env, val, "[Ljava/lang/Object;",
                     )
-                    .unwrap_or(0);
+                    .unwrap_or(0));
                 }
             }
             // JS object → try __jptr property (Proxy-wrapped or {__jptr, __jclass})
@@ -153,18 +185,18 @@ pub(super) unsafe fn marshal_js_to_jvalue(
                 if !jptr_val.is_undefined() && !jptr_val.is_null() {
                     let result = js_value_to_u64_or_zero(ctx, jptr_val);
                     jptr_val.free(ctx);
-                    return result;
+                    return MarshaledJValue::raw(result);
                 }
                 jptr_val.free(ctx);
             }
             // Autobox: JS number/boolean/bigint → Java 包装类型
             // 传入目标类型签名，精确匹配 Long/Float/Short/Byte 等
             if let Some(boxed) = autobox_primitive_to_jobject(ctx, env, val, sig) {
-                return boxed;
+                return MarshaledJValue::local(boxed);
             }
-            0
+            MarshaledJValue::raw(0)
         }
-        _ => js_value_to_u64_or_zero(ctx, val),
+        _ => MarshaledJValue::raw(js_value_to_u64_or_zero(ctx, val)),
     }
 }
 
@@ -287,9 +319,16 @@ unsafe fn js_array_to_java_primitive_array(
                 let elem = JSValue(elem_raw);
                 // 递归 marshal: 内层若是 "[X" 会再进 js_array_to_java_primitive_array,
                 // 内层若是 "Ljava/.../X;" 走 L 分支 (string/autobox/__jptr)
-                let elem_jval = marshal_js_to_jvalue(ctx, env, elem, Some(inner_sig));
+                let elem_jval = marshal_js_to_jvalue_owned(ctx, env, elem, Some(inner_sig));
                 elem.free(ctx);
-                set_elem(env, jarr, i, elem_jval as *mut std::ffi::c_void);
+                set_elem(env, jarr, i, elem_jval.raw as *mut std::ffi::c_void);
+                if elem_jval.owned_local_ref && elem_jval.raw != 0 {
+                    delete(env, elem_jval.raw as *mut std::ffi::c_void);
+                }
+                if jni_check_exc(env) {
+                    delete(env, cls);
+                    return None;
+                }
             }
             delete(env, cls);
             Some(jarr as u64)

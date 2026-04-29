@@ -556,12 +556,54 @@ unsafe fn cleanup_and_throw_type(
     ffi::JS_ThrowTypeError(ctx, msg.as_ptr() as *const _)
 }
 
+struct JniArgList {
+    env: JniEnv,
+    values: Vec<u64>,
+    owned_local_refs: Vec<u64>,
+}
+
+impl JniArgList {
+    fn new(env: JniEnv, capacity: usize) -> Self {
+        Self {
+            env,
+            values: Vec::with_capacity(capacity),
+            owned_local_refs: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, value: MarshaledJValue) {
+        if value.owned_local_ref && value.raw != 0 {
+            self.owned_local_refs.push(value.raw);
+        }
+        self.values.push(value.raw);
+    }
+
+    fn as_ptr(&self) -> *const u64 {
+        self.values.as_ptr()
+    }
+}
+
+impl Drop for JniArgList {
+    fn drop(&mut self) {
+        if self.owned_local_refs.is_empty() {
+            return;
+        }
+        unsafe {
+            let delete_local_ref: DeleteLocalRefFn =
+                jni_fn!(self.env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+            for raw in self.owned_local_refs.drain(..) {
+                delete_local_ref(self.env, raw as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
 unsafe fn build_invoke_jargs(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
     argv: *mut ffi::JSValue,
     param_types: &[String],
-) -> Vec<u64> {
+) -> JniArgList {
     build_jargs_from_argv(ctx, env, argv, 4, param_types)
 }
 
@@ -571,11 +613,11 @@ unsafe fn build_jargs_from_argv(
     argv: *mut ffi::JSValue,
     start_index: usize,
     param_types: &[String],
-) -> Vec<u64> {
-    let mut jargs = Vec::with_capacity(param_types.len());
+) -> JniArgList {
+    let mut jargs = JniArgList::new(env, param_types.len());
     for (i, type_sig) in param_types.iter().enumerate() {
         let js_arg = JSValue(*argv.add(start_index + i));
-        jargs.push(marshal_js_to_jvalue(
+        jargs.push(marshal_js_to_jvalue_owned(
             ctx,
             env,
             js_arg,

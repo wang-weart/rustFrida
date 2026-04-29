@@ -50,13 +50,10 @@
             return _wrapJavaObj(value.__jptr, value.__jclass);
         }
         // Rust marshal 把 Java 对象数组自动转 JS Array, 元素为裸 {__jptr, __jclass}。
-        // 这里递归把每个元素包成 Proxy, 让 `arr[i].method()` 生效。
+        // 这里递归把每个元素包成 Proxy, 让 `arr[i].method()` 和嵌套数组访问都生效。
         if (Array.isArray(value)) {
             for (var i = 0; i < value.length; i++) {
-                var e = value[i];
-                if (_isWrappedJavaObject(e)) {
-                    value[i] = _wrapJavaObj(e.__jptr, e.__jclass);
-                }
+                value[i] = _wrapJavaReturn(value[i]);
             }
         }
         return value;
