@@ -84,6 +84,9 @@ adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
 
 # 详细日志
 ./rustfrida --pid <pid> --verbose
+
+# 同步输出日志到文件（终端仍正常输出，文件为纯文本）
+./rustfrida --pid <pid> -l script.js -o /data/local/tmp/rustfrida.log
 ```
 
 ### REPL 命令
@@ -194,7 +197,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `ptr()`, `Memory`, `Module`, `Interceptor`, `hook()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `ptr()`, `Memory`, `File`, `Module`, `Interceptor`, `hook()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -1005,7 +1008,8 @@ hook(Jni.addr("RegisterNatives"), function(env, clazz, methods_ptr, count) {
     for (var i = 0; i < methods.length; i++) {
         var m = methods[i];
         var mod = Module.findByAddress(m.fnPtr);
-        console.log("  " + m.name + " " + m.sig + " → " + mod.name + "+" + m.fnPtr.sub(mod.base));
+        var where = mod === null ? m.fnPtr.toString() : mod.name + "+" + m.fnPtr.sub(mod.base);
+        console.log("  " + (m.name || "<null>") + " " + (m.sig || "<null>") + " → " + where);
     }
     return this.orig();
 }, 1);
@@ -1186,6 +1190,51 @@ p.readPointer().readCString(); // 链式解引用
 ## console
 
 `console.log(...)` / `console.info(...)` / `console.warn(...)` / `console.error(...)` / `console.debug(...)`
+
+## File
+
+Frida 兼容的同步文件 API。适合在 agent 内直接读写目标进程可访问的路径；`new File()` 底层按 `fopen()` 的 mode 字符串打开，GC 时会自动关闭，但长脚本建议显式 `close()`。
+
+```js
+// 静态读写
+File.writeAllText("/data/local/tmp/demo.txt", "hello\n");
+var text = File.readAllText("/data/local/tmp/demo.txt");
+
+var bytes = new Uint8Array([0x41, 0x42, 0x43]).buffer;
+File.writeAllBytes("/data/local/tmp/demo.bin", bytes);
+var roundtrip = File.readAllBytes("/data/local/tmp/demo.bin");
+
+// 流式读写
+var f = new File("/data/local/tmp/demo.txt", "rb");
+console.log(f.readLine());          // 保留行尾 \n，和 Frida 一致
+console.log(f.tell());
+f.seek(0, File.SEEK_SET);
+console.log(f.readText(5));
+f.close();
+
+var out = new File("/data/local/tmp/out.bin", "wb");
+out.write(roundtrip);               // string / ArrayBuffer / TypedArray / number[]
+out.flush();
+out.close();
+```
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `File.readAllBytes(path)` | `string` | `ArrayBuffer` |
+| `File.readAllText(path)` | `string` | `string` (UTF-8) |
+| `File.writeAllBytes(path, data)` | `string, ArrayBuffer\|TypedArray\|number[]` | `undefined` |
+| `File.writeAllText(path, text)` | `string, string` | `undefined` |
+| `new File(path, mode)` | `string, string` | `File` |
+| `file.tell()` | — | `number` |
+| `file.seek(offset, whence?)` | `number, File.SEEK_*?` | `number` (`fseek` 结果) |
+| `file.readBytes(size?)` | `number?` | `ArrayBuffer` |
+| `file.readText(size?)` | `number?` | `string` (UTF-8) |
+| `file.readLine()` | — | `string` |
+| `file.write(data)` | `string\|ArrayBuffer\|TypedArray\|number[]` | `undefined` |
+| `file.flush()` | — | `undefined` |
+| `file.close()` | — | `undefined` |
+
+常量：`File.SEEK_SET`、`File.SEEK_CUR`、`File.SEEK_END`。
 
 ## QBDI Trace
 
