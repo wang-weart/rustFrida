@@ -14,6 +14,7 @@ use super::jni_core::{get_or_init_vm, jni_check_exc, jni_fn_ptr, JniEnv, NewGlob
 
 const JNI_OK: i32 = 0;
 const K_ART_TI_VERSION: i32 = 0x7001_0200;
+const JVMTI_ITERATION_ABORT: i32 = 0;
 const JVMTI_ITERATION_CONTINUE: i32 = 1;
 const JVMTI_HEAP_OBJECT_EITHER: i32 = 3;
 const JVMTI_ERROR_NONE: i32 = 0;
@@ -38,14 +39,31 @@ type JvmtiGetObjectsWithTagsFn =
     unsafe extern "C" fn(*mut c_void, i32, *const i64, *mut i32, *mut *mut *mut c_void, *mut *mut i64) -> i32;
 type JvmtiHeapObjectCallback = unsafe extern "C" fn(i64, i64, *mut i64, *mut c_void) -> i32;
 
+struct TagState {
+    tag: i64,
+    seen: usize,
+    max_count: usize,
+}
+
 unsafe extern "C" fn tag_matching_object(
     _class_tag: i64,
     _size: i64,
     tag_ptr: *mut i64,
     user_data: *mut c_void,
 ) -> i32 {
+    if user_data.is_null() {
+        return JVMTI_ITERATION_ABORT;
+    }
+    let state = &mut *(user_data as *mut TagState);
+    if state.max_count != 0 && state.seen >= state.max_count {
+        return JVMTI_ITERATION_ABORT;
+    }
     if !tag_ptr.is_null() {
-        *tag_ptr = user_data as isize as i64;
+        *tag_ptr = state.tag;
+        state.seen = state.seen.saturating_add(1);
+        if state.max_count != 0 && state.seen >= state.max_count {
+            return JVMTI_ITERATION_ABORT;
+        }
     }
     JVMTI_ITERATION_CONTINUE
 }
@@ -65,12 +83,17 @@ pub(super) unsafe fn jvmti_enumerate_instances(
 
     let iterate: JvmtiIterateOverInstancesOfClassFn =
         std::mem::transmute(jvmti_fn_ptr(jvmti, JVMTI_ITERATE_OVER_INSTANCES_OF_CLASS));
+    let mut tag_state = TagState {
+        tag,
+        seen: 0,
+        max_count,
+    };
     let ret = iterate(
         jvmti,
         target_cls,
         JVMTI_HEAP_OBJECT_EITHER,
         tag_matching_object,
-        tag as isize as *mut c_void,
+        &mut tag_state as *mut TagState as *mut c_void,
     );
     if ret != JVMTI_ERROR_NONE {
         return Err(format!("IterateOverInstancesOfClass failed: {}", ret));

@@ -1029,6 +1029,7 @@ unsafe extern "C" fn js_java_set_classloader(
 /// spawn 模式下必须在 resume_child 之前调用,确保 inline hooks 在所有
 /// 线程暂停时安装,避免代码覆写与执行的竞态条件。
 pub fn pre_init_art_controller() -> Result<(), String> {
+    JAVA_SUBSYSTEM_TOUCHED.store(true, Ordering::Release);
     let env = ensure_jni_initialized().map_err(|e| format!("JNI init failed: {}", e))?;
     unsafe {
         // 探测 ArtMethodSpec (需要一个已知的 native 方法来校准偏移)
@@ -1062,6 +1063,7 @@ pub fn set_host_stealth_mode(mode: i64) -> Result<u8, String> {
 /// Spawn 模式延迟 JNI 初始化：AttachCurrentThread + cache reflect IDs + 触发 gate hook。
 /// 在 resume 之后调用（ART 已完成 post-fork 初始化）。
 pub fn deferred_java_init() -> Result<(), String> {
+    JAVA_SUBSYSTEM_TOUCHED.store(true, Ordering::Release);
     let env = ensure_jni_initialized().map_err(|e| format!("deferred_java_init: {}", e))?;
     unsafe {
         cache_reflect_ids(env);
@@ -1079,9 +1081,24 @@ pub fn deferred_java_init() -> Result<(), String> {
 
 use std::sync::atomic::{AtomicBool, Ordering};
 static REFLECT_CACHE_INITED: AtomicBool = AtomicBool::new(false);
+static JAVA_SUBSYSTEM_TOUCHED: AtomicBool = AtomicBool::new(false);
+
+fn java_cleanup_needed() -> bool {
+    if JAVA_SUBSYSTEM_TOUCHED.load(Ordering::Acquire) || art_controller_initialized() {
+        return true;
+    }
+
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|registry| !registry.is_empty())
+}
+
+pub fn java_subsystem_active_for_cleanup() -> bool {
+    java_cleanup_needed()
+}
 
 /// 延迟初始化 Java reflection 缓存（PID 注入模式下首次调用 Java API 时触发）
 pub(crate) fn lazy_init_reflect_cache() {
+    JAVA_SUBSYSTEM_TOUCHED.store(true, Ordering::Release);
     if REFLECT_CACHE_INITED.load(Ordering::Acquire) {
         return;
     }
@@ -1098,141 +1115,243 @@ pub(crate) fn lazy_init_reflect_cache() {
     }
 }
 
-pub fn register_java_api(ctx: &JSContext) {
-    // PID 注入模式下延迟 JNI 初始化：仅在首次调用 Java.hook/fastHook 等
-    // Java API 时才执行 cache_reflect_ids，避免在 360 加固等环境下 jsinit 阶段卡死
-    // Spawn 模式仍走 deferred_java_init 在 resume 后完成
+unsafe extern "C" fn js_java_ensure_initialized(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    match install_java_api(ctx) {
+        Ok(java) => java,
+        Err(err) => throw_internal_error(ctx, err),
+    }
+}
 
+pub fn register_lazy_java_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
     unsafe {
-        // Create the "Java" namespace object
-        let java_obj = ffi::JS_NewObject(ctx.as_ptr());
-
         let ctx_ptr = ctx.as_ptr();
-        add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "hookQuick", js_java_hook_quick, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastHook", js_fast_hook, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "managedHookDsl", js_managed_hook_dsl, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "managedReadCounter", js_managed_read_counter, 2);
-        add_cfunction_to_object(ctx_ptr, java_obj, "managedDrainMessages", js_managed_drain_messages, 2);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastHookSig", js_fast_hook_signature, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastHookCheck", js_fast_hook_check, 2);
-        add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "deopt", js_java_deopt, 0);
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "deoptimizeBootImage",
-            js_java_deoptimize_boot_image,
-            0,
-        );
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "deoptimizeEverything",
-            js_java_deoptimize_everything,
-            0,
-        );
-        add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeMethod", js_java_deoptimize_method, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "setManagedHookGuard",
-            js_set_managed_reentry_guard,
-            1,
-        );
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "managedHookGuardStats",
-            js_managed_reentry_guard_stats,
-            0,
-        );
-        add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_artRouteStats", js_art_route_stats, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_resetArtRouteStats", js_reset_art_route_stats, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_fastHookStats", js_fast_hook_stats, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
-        // Instance method invocation helper used by Java object proxies
-        add_cfunction_to_object(ctx_ptr, java_obj, "_invokeMethod", js_java_invoke_method, 4);
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "_invokeStaticMethod",
-            js_java_invoke_static_method,
-            4,
-        );
-        add_cfunction_to_object(ctx_ptr, java_obj, "_newObject", js_java_new_object, 2);
-        add_cfunction_to_object(ctx_ptr, java_obj, "getField", js_java_get_field, 4);
-        // Frida-style FieldWrapper 后端（无 FIELD_CACHE 锁）
-        add_cfunction_to_object(ctx_ptr, java_obj, "_fieldMeta", js_java_field_meta, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_readField", js_java_read_field, 5);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_writeField", js_java_write_field, 6);
-
-        // Java 数组访问 (arr.length / arr[i])
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "_arrayLength",
-            java_array_api::js_java_array_length,
-            1,
-        );
-        add_cfunction_to_object(ctx_ptr, java_obj, "_arrayGet", java_array_api::js_java_array_get, 3);
-
-        // 检测面测试 API
-        add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_jitInfo", js_java_jit_info, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "compileMethod", js_java_compile_method, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastMethod", js_java_fast_method, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastConstructor", js_java_fast_constructor, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastField", js_java_fast_field, 3);
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "_setForcedInterpretOnly",
-            js_java_set_forced_interpret_only,
-            1,
-        );
-        add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_reprobeClassLoader", js_reprobe_classloader, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_classLoaders", js_java_classloaders, 0);
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "_findClassWithLoader",
-            js_java_find_class_with_loader,
-            2,
-        );
-        add_cfunction_to_object(ctx_ptr, java_obj, "_findClassObject", js_java_find_class_object, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_setClassLoader", js_java_set_classloader, 1);
-        // Java.choose() backend: 走 VMDebug.getInstancesOfClasses 枚举堆上实例
-        add_cfunction_to_object(ctx_ptr, java_obj, "_enumerateInstances", js_java_enumerate_instances, 3);
-        // Java.choose() 配套：批量释放 wrapper 持有的 JNI global refs
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "_releaseInstanceRefs",
-            js_java_release_instance_refs,
-            1,
-        );
-
-        // Set Java object on global
-        global.set_property(ctx.as_ptr(), "Java", JSValue(java_obj));
+        let java_obj = ffi::JS_NewObject(ctx_ptr);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_ensureInitialized", js_java_ensure_initialized, 0);
+        global.set_property(ctx_ptr, "Java", JSValue(java_obj));
     }
 
     global.free(ctx.as_ptr());
 
-    // Load boot script: sets up Java.use() Proxy API, captures hook/unhook/
-    // _methods in closures, then removes them from the Java object.
-    let boot = include_str!("java_boot.js");
-    match ctx.eval(boot, "<java_boot>") {
+    let boot = r#"
+(function() {
+    "use strict";
+    var lazy = Java;
+    var ensure = lazy._ensureInitialized;
+    var initialized = false;
+    var real = null;
+    delete lazy._ensureInitialized;
+
+    function getReal() {
+        if (!initialized) {
+            real = ensure();
+            initialized = true;
+        }
+        return real;
+    }
+
+    globalThis.Java = new Proxy(lazy, {
+        get: function(_, prop) {
+            if (prop === "__lazy") return !initialized;
+            if (prop === "toString") return function() { return initialized ? "[object Java]" : "[object LazyJava]"; };
+            var target = getReal();
+            return target[prop];
+        },
+        set: function(_, prop, value) {
+            var target = getReal();
+            target[prop] = value;
+            return true;
+        },
+        has: function(_, prop) {
+            var target = getReal();
+            return prop in target;
+        },
+        ownKeys: function(_) {
+            return Reflect.ownKeys(getReal());
+        },
+        getOwnPropertyDescriptor: function(_, prop) {
+            return Object.getOwnPropertyDescriptor(getReal(), prop);
+        }
+    });
+})();
+"#;
+    match ctx.eval(boot, "<java_lazy_boot>") {
         Ok(val) => val.free(ctx.as_ptr()),
-        Err(e) => output_verbose(&format!("[java_api] boot script error: {}", e)),
+        Err(e) => output_verbose(&format!("[java_api] lazy boot script error: {}", e)),
+    }
+}
+
+/// Install full Java API: hook/unhook (C-level) + _methods, then eval boot script
+/// to set up the Proxy-based Java.use() API.
+unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue, String> {
+    if ctx_ptr.is_null() {
+        return Err("Java lazy init: JSContext is null".to_string());
+    }
+    JAVA_SUBSYSTEM_TOUCHED.store(true, Ordering::Release);
+    output_verbose("[java_api] installing Java API on first use");
+
+    let global_raw = ffi::JS_GetGlobalObject(ctx_ptr);
+    let global = JSValue(global_raw);
+
+    // Create the "Java" namespace object
+    let java_obj = ffi::JS_NewObject(ctx_ptr);
+
+    add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "hookQuick", js_java_hook_quick, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "fastHook", js_fast_hook, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "managedHookDsl", js_managed_hook_dsl, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "managedReadCounter", js_managed_read_counter, 2);
+    add_cfunction_to_object(ctx_ptr, java_obj, "managedDrainMessages", js_managed_drain_messages, 2);
+    add_cfunction_to_object(ctx_ptr, java_obj, "fastHookSig", js_fast_hook_signature, 1);
+    add_cfunction_to_object(ctx_ptr, java_obj, "fastHookCheck", js_fast_hook_check, 2);
+    add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
+    add_cfunction_to_object(ctx_ptr, java_obj, "deopt", js_java_deopt, 0);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "deoptimizeBootImage",
+        js_java_deoptimize_boot_image,
+        0,
+    );
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "deoptimizeEverything",
+        js_java_deoptimize_everything,
+        0,
+    );
+    add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeMethod", js_java_deoptimize_method, 3);
+    add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
+    add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "setManagedHookGuard",
+        js_set_managed_reentry_guard,
+        1,
+    );
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "managedHookGuardStats",
+        js_managed_reentry_guard_stats,
+        0,
+    );
+    add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_artRouteStats", js_art_route_stats, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_resetArtRouteStats", js_reset_art_route_stats, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_fastHookStats", js_fast_hook_stats, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
+    // Instance method invocation helper used by Java object proxies
+    add_cfunction_to_object(ctx_ptr, java_obj, "_invokeMethod", js_java_invoke_method, 4);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_invokeStaticMethod",
+        js_java_invoke_static_method,
+        4,
+    );
+    add_cfunction_to_object(ctx_ptr, java_obj, "_newObject", js_java_new_object, 2);
+    add_cfunction_to_object(ctx_ptr, java_obj, "getField", js_java_get_field, 4);
+    // Frida-style FieldWrapper 后端（无 FIELD_CACHE 锁）
+    add_cfunction_to_object(ctx_ptr, java_obj, "_fieldMeta", js_java_field_meta, 3);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_readField", js_java_read_field, 5);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_writeField", js_java_write_field, 6);
+
+    // Java 数组访问 (arr.length / arr[i])
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_arrayLength",
+        java_array_api::js_java_array_length,
+        1,
+    );
+    add_cfunction_to_object(ctx_ptr, java_obj, "_arrayGet", java_array_api::js_java_array_get, 3);
+
+    // 检测面测试 API
+    add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_jitInfo", js_java_jit_info, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "compileMethod", js_java_compile_method, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "fastMethod", js_java_fast_method, 3);
+    add_cfunction_to_object(ctx_ptr, java_obj, "fastConstructor", js_java_fast_constructor, 3);
+    add_cfunction_to_object(ctx_ptr, java_obj, "fastField", js_java_fast_field, 3);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_setForcedInterpretOnly",
+        js_java_set_forced_interpret_only,
+        1,
+    );
+    add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_reprobeClassLoader", js_reprobe_classloader, 0);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_classLoaders", js_java_classloaders, 0);
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_findClassWithLoader",
+        js_java_find_class_with_loader,
+        2,
+    );
+    add_cfunction_to_object(ctx_ptr, java_obj, "_findClassObject", js_java_find_class_object, 1);
+    add_cfunction_to_object(ctx_ptr, java_obj, "_setClassLoader", js_java_set_classloader, 1);
+    // Java.choose() backend: VMDebug/JVMTI reliable live-object enumeration
+    add_cfunction_to_object(ctx_ptr, java_obj, "_enumerateInstances", js_java_enumerate_instances, 3);
+    // Java.choose() 配套：批量释放 wrapper 持有的 JNI global refs
+    add_cfunction_to_object(
+        ctx_ptr,
+        java_obj,
+        "_releaseInstanceRefs",
+        js_java_release_instance_refs,
+        1,
+    );
+
+    // Set Java object on global before evaluating java_boot; boot captures these C
+    // functions into closures and then hides the raw methods from the public API.
+    global.set_property(ctx_ptr, "Java", JSValue(java_obj));
+
+    let boot = include_str!("java_boot.js");
+    let cscript = std::ffi::CString::new(boot).map_err(|e| format!("Invalid java boot script: {}", e))?;
+    let cfilename = std::ffi::CString::new("<java_boot>").unwrap();
+    ffi::qjs_update_stack_top(ctx_ptr);
+    let val = ffi::JS_Eval(
+        ctx_ptr,
+        cscript.as_ptr(),
+        boot.len(),
+        cfilename.as_ptr(),
+        ffi::JS_EVAL_TYPE_GLOBAL as i32,
+    );
+    let val = JSValue(val);
+    if val.is_exception() {
+        let exc = JSValue(ffi::JS_GetException(ctx_ptr));
+        let message = exc
+            .to_string(ctx_ptr)
+            .unwrap_or_else(|| "Java boot script failed".to_string());
+        exc.free(ctx_ptr);
+        global.free(ctx_ptr);
+        return Err(message);
+    }
+    val.free(ctx_ptr);
+
+    let java_name = std::ffi::CString::new("Java").unwrap();
+    let installed = ffi::JS_GetPropertyStr(ctx_ptr, global.raw(), java_name.as_ptr());
+    global.free(ctx_ptr);
+    Ok(installed)
+}
+
+pub fn register_java_api(ctx: &JSContext) {
+    unsafe {
+        match install_java_api(ctx.as_ptr()) {
+            Ok(java) => JSValue(java).free(ctx.as_ptr()),
+            Err(e) => output_verbose(&format!("[java_api] boot script error: {}", e)),
+        }
     }
 }
 
@@ -1328,6 +1447,10 @@ pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Opti
 /// 必须与 `cut_native_hooks` / `cut_art_controller_hooks` 一起在 drain 之前完成，
 /// 否则 g_thunk_in_flight 永远 ≠ 0。
 pub fn cut_java_hooks() {
+    if !java_cleanup_needed() {
+        return;
+    }
+
     if let Ok(env) = ensure_jni_initialized() {
         unsafe {
             cleanup_enumerated_classloader_refs(env);
@@ -1412,6 +1535,10 @@ pub fn drain_thunk_in_flight() -> bool {
 /// 必须在 `drain_thunk_in_flight` 之后调用。此时无任何线程在 thunk 或其 callee 中，
 /// 释放 ArtMethod 堆内存 + JNI ref 安全。router 表最后清空。
 pub fn free_java_hooks() {
+    if !java_cleanup_needed() {
+        return;
+    }
+
     // router 表清空 (art_controller 的 OAT patch 已由 cut_art_controller_hooks revert)
     unsafe {
         hook_ffi::hook_art_router_table_clear();
@@ -1447,6 +1574,10 @@ pub fn free_java_hooks() {
 /// drain 超时则跳过 free（避免线程苏醒踩已释放资源）。
 /// 新代码应该用编排器模式 (cut_* → drain → free_*) 以便与 native/OAT 并行切断。
 pub fn cleanup_java_hooks() {
+    if !java_cleanup_needed() {
+        return;
+    }
+
     cut_java_hooks();
     let drained = drain_thunk_in_flight();
     if !drained {

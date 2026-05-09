@@ -203,7 +203,7 @@ fn find_stack_high_for_tid(tid: pid_t) -> Option<u64> {
 
 /// 逐线程检查 PC/LR/活动栈是否落在保护区间。
 /// 返回 (ok, busy_pc_hits, busy_lr_hits, busy_stack_hits, first_stack_hit, probed, skipped)
-fn check_all_threads(ranges: &[(u64, u64)]) -> (bool, usize, usize, usize, u64, usize, usize) {
+fn check_all_threads(ranges: &[(u64, u64)], scan_stack: bool) -> (bool, usize, usize, usize, u64, usize, usize) {
     let pid = unsafe { libc::getpid() };
     let self_tid = unsafe { gettid() };
     let dir = match fs::read_dir("/proc/self/task") {
@@ -226,7 +226,11 @@ fn check_all_threads(ranges: &[(u64, u64)]) -> (bool, usize, usize, usize, u64, 
         if tid == self_tid {
             continue;
         }
-        let stack_high = find_stack_high_for_tid(tid).unwrap_or(0);
+        let stack_high = if scan_stack {
+            find_stack_high_for_tid(tid).unwrap_or(0)
+        } else {
+            0
+        };
         match probe_one_thread(tid, pid, stack_high) {
             Some((pc, lr, _sp, stack, first)) => {
                 probed += 1;
@@ -248,8 +252,7 @@ fn check_all_threads(ranges: &[(u64, u64)]) -> (bool, usize, usize, usize, u64, 
     (ok, pc_hits, lr_hits, stack_hits, first_stack_hit, probed, skipped)
 }
 
-/// 等待所有线程 PC/LR 离开保护区间。超时返回 false (应放弃 munmap)
-pub fn wait_until_clean(ranges: &[(u64, u64)], total_timeout_ms: u64) -> bool {
+fn wait_until_clean_impl(ranges: &[(u64, u64)], total_timeout_ms: u64, scan_stack: bool) -> bool {
     if ranges.is_empty() {
         return true;
     }
@@ -269,11 +272,12 @@ pub fn wait_until_clean(ranges: &[(u64, u64)], total_timeout_ms: u64) -> bool {
     let mut last_report = Instant::now();
     loop {
         attempt += 1;
-        let (ok, pc, lr, stack, first_stack, probed, skipped) = check_all_threads(ranges);
+        let (ok, pc, lr, stack, first_stack, probed, skipped) = check_all_threads(ranges, scan_stack);
         if ok {
             log_msg(format!(
-                "[safepoint] clean after {} attempt(s), probed={} skipped={}, elapsed={}ms",
+                "[safepoint] clean after {} attempt(s), mode={}, probed={} skipped={}, elapsed={}ms",
                 attempt,
+                if scan_stack { "pc/lr/stack" } else { "pc/lr" },
                 probed,
                 skipped,
                 start.elapsed().as_millis()
@@ -298,4 +302,15 @@ pub fn wait_until_clean(ranges: &[(u64, u64)], total_timeout_ms: u64) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// 等待所有线程 PC/LR 和活动栈离开保护区间。超时返回 false (应放弃 munmap)。
+pub fn wait_until_clean(ranges: &[(u64, u64)], total_timeout_ms: u64) -> bool {
+    wait_until_clean_impl(ranges, total_timeout_ms, true)
+}
+
+/// Native-only hook cleanup 不需要 ART quick stack 的返回地址保护，避免在大型
+/// 进程里为 Java/ART 专用场景扫描所有线程栈。
+pub fn wait_until_pc_lr_clean(ranges: &[(u64, u64)], total_timeout_ms: u64) -> bool {
+    wait_until_clean_impl(ranges, total_timeout_ms, false)
 }

@@ -12,8 +12,8 @@ use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
     cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
     drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine,
-    init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
-    set_qbdi_helper_blob, set_qbdi_output_dir,
+    init_hook_engine, java_subsystem_active_for_cleanup, load_script, load_script_with_filename,
+    set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 #[cfg(feature = "qbdi")]
 use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
@@ -301,14 +301,25 @@ pub fn cleanup() {
     stage("phase3 release_all_recomp", &mut t);
 
     let mut protected_ranges = hook_engine_exec_ranges();
-    protected_ranges.extend(crate::recompiler::get_retained_ranges());
+    let retained_recomp_ranges = crate::recompiler::get_retained_ranges();
+    let scan_stack_for_art_frames = java_subsystem_active_for_cleanup() || !retained_recomp_ranges.is_empty();
+    protected_ranges.extend(retained_recomp_ranges);
     if !protected_ranges.is_empty() {
         log_msg(format!(
-            "[quickjs] safepoint protected ranges={}\n",
-            protected_ranges.len()
+            "[quickjs] safepoint protected ranges={}, mode={}\n",
+            protected_ranges.len(),
+            if scan_stack_for_art_frames {
+                "pc/lr/stack"
+            } else {
+                "pc/lr"
+            }
         ));
     }
-    let stack_clean = crate::safepoint::wait_until_clean(&protected_ranges, 30_000);
+    let stack_clean = if scan_stack_for_art_frames {
+        crate::safepoint::wait_until_clean(&protected_ranges, 30_000)
+    } else {
+        crate::safepoint::wait_until_pc_lr_clean(&protected_ranges, 30_000)
+    };
     stage("phase3 safepoint_stack_clean", &mut t);
     if !stack_clean {
         log_msg(
@@ -328,8 +339,14 @@ pub fn cleanup() {
     crate::recompiler::release_all();
     stage("phase4 release_guard_recomp", &mut t);
     let mut post_guard_ranges = hook_engine_exec_ranges();
-    post_guard_ranges.extend(crate::recompiler::get_retained_ranges());
-    let post_guard_clean = crate::safepoint::wait_until_clean(&post_guard_ranges, 30_000);
+    let post_guard_recomp_ranges = crate::recompiler::get_retained_ranges();
+    let post_guard_scan_stack = java_subsystem_active_for_cleanup() || !post_guard_recomp_ranges.is_empty();
+    post_guard_ranges.extend(post_guard_recomp_ranges);
+    let post_guard_clean = if post_guard_scan_stack {
+        crate::safepoint::wait_until_clean(&post_guard_ranges, 30_000)
+    } else {
+        crate::safepoint::wait_until_pc_lr_clean(&post_guard_ranges, 30_000)
+    };
     stage("phase4 safepoint_after_guard_cut", &mut t);
     if !post_guard_clean {
         log_msg(
