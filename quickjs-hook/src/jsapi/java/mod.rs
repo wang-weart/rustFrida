@@ -1158,7 +1158,6 @@ pub fn register_lazy_java_api(ctx: &JSContext) {
 
     globalThis.Java = new Proxy(lazy, {
         get: function(_, prop) {
-            if (prop === "__lazy") return !initialized;
             if (prop === "toString") return function() { return initialized ? "[object Java]" : "[object LazyJava]"; };
             var target = getReal();
             return target[prop];
@@ -1194,7 +1193,6 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
         return Err("Java lazy init: JSContext is null".to_string());
     }
     JAVA_SUBSYSTEM_TOUCHED.store(true, Ordering::Release);
-    output_verbose("[java_api] installing Java API on first use");
 
     let global_raw = ffi::JS_GetGlobalObject(ctx_ptr);
     let global = JSValue(global_raw);
