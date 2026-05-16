@@ -98,6 +98,7 @@ enum _FridaMessageType
   FRIDA_MESSAGE_BYE,
   FRIDA_MESSAGE_ERROR_DLOPEN,
   FRIDA_MESSAGE_ERROR_DLSYM,
+  FRIDA_MESSAGE_LOG,
 };
 
 struct _FridaHelloMessage

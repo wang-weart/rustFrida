@@ -218,6 +218,7 @@ static bool frida_send_ready (int sockfd, const FridaLibcApi * libc);
 static bool frida_receive_ack (int sockfd, const FridaLibcApi * libc);
 static bool frida_send_bye (int sockfd, FridaUnloadPolicy unload_policy, const FridaLibcApi * libc);
 static bool frida_send_error (int sockfd, FridaMessageType type, const char * message, const FridaLibcApi * libc);
+static bool frida_send_log (int sockfd, const char * message, const FridaLibcApi * libc);
 
 static bool frida_receive_chunk (int sockfd, void * buffer, size_t length, const FridaLibcApi * api);
 static int frida_receive_fd (int sockfd, const FridaLibcApi * libc);
@@ -225,7 +226,7 @@ static int frida_receive_fd_diag (int sockfd, const FridaLibcApi * libc, char * 
 static bool frida_send_chunk (int sockfd, const void * buffer, size_t length, const FridaLibcApi * libc);
 static void frida_enable_close_on_exec (int fd, const FridaLibcApi * libc);
 
-static bool rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule * module);
+static bool rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule * module, int diagfd);
 static void * rustfrida_find_export (RustFridaLinkedModule * module, const char * symbol);
 static void rustfrida_close_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static void rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
@@ -604,9 +605,15 @@ rustfrida_maps_line_add_module (RustFridaSymbolResolver * resolver, const char *
   path = cursor;
   if (*path != '/')
     return false;
-  if (!frida_str_has_suffix (path, ".so") &&
-      !frida_str_has_suffix (path, "/linker64") &&
-      !frida_str_has_suffix (path, "/app_process64"))
+  /*
+   * Only index the platform modules needed by the agent's imports. Scanning
+   * every app .so is both noisy and unsafe in hardened apps with unusual
+   * mappings or intentionally hostile ELF layouts.
+   */
+  if (!frida_str_has_suffix (path, "/libc.so") &&
+      !frida_str_has_suffix (path, "/libdl.so") &&
+      !frida_str_has_suffix (path, "/libm.so") &&
+      !frida_str_has_suffix (path, "/linker64"))
   {
     return false;
   }
@@ -1054,7 +1061,7 @@ rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name)
 }
 
 static bool
-rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule * module)
+rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule * module, int diagfd)
 {
   size_t page_size = 4096;
   ssize_t file_size;
@@ -1078,6 +1085,7 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
 
   frida_memset (module, 0, sizeof (*module));
   rustfrida_get_fd_vma_name (fd, agent_vma_name, sizeof (agent_vma_name), libc);
+  frida_send_log (diagfd, "link: start", libc);
 
   file_size = frida_syscall_3 (__NR_lseek, fd, 0, SEEK_END);
   if (file_size <= 0)
@@ -1099,6 +1107,7 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
     rustfrida_set_error (module, libc, "invalid agent ELF");
     goto fail;
   }
+  frida_send_log (diagfd, "link: elf mapped", libc);
 
   if (file_ehdr->e_phoff + (file_ehdr->e_phnum * sizeof (ElfW(Phdr))) > (size_t) file_size)
   {
@@ -1145,7 +1154,7 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
     const ElfW(Phdr) * phdr = &file_phdrs[i];
     ElfW(Addr) seg_start;
     ElfW(Addr) seg_end;
-    ElfW(Addr) file_backed_end;
+    ElfW(Addr) map_size;
     ElfW(Addr) target;
     ElfW(Off) file_page_start;
     int prot;
@@ -1164,32 +1173,30 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
 
     seg_start = rustfrida_align_down (phdr->p_vaddr, page_size);
     seg_end = rustfrida_align_up (phdr->p_vaddr + phdr->p_memsz, page_size);
-    file_backed_end = rustfrida_align_up (phdr->p_vaddr + phdr->p_filesz, page_size);
+    map_size = seg_end - seg_start;
     target = load_bias + seg_start;
     file_page_start = rustfrida_align_down (phdr->p_offset, page_size);
     prot = rustfrida_phdr_prot (phdr);
 
-    if (phdr->p_filesz != 0)
+    if ((uint64_t) file_page_start + map_size > (uint64_t) file_size)
     {
-      void * mapped = frida_raw_mmap ((void *) target, file_backed_end - seg_start, prot,
+      rustfrida_set_error (module, libc, "agent padded segment out of range");
+      goto fail;
+    }
+
+    /*
+     * The host pads the memfd so the file covers each LOAD segment's full
+     * p_memsz. Mapping the complete segment from that fd avoids separate
+     * anonymous BSS VMAs, which hardened apps may flag as synthetic ELF tails.
+     */
+    {
+      void * mapped = frida_raw_mmap ((void *) target, map_size, prot,
           MAP_PRIVATE | MAP_FIXED, fd, file_page_start);
       if (mapped == MAP_FAILED)
       {
         rustfrida_set_error (module, libc, "map agent segment failed");
         goto fail;
       }
-    }
-
-    if (seg_end > file_backed_end)
-    {
-      void * mapped = frida_raw_mmap ((void *) (load_bias + file_backed_end), seg_end - file_backed_end,
-          prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-      if (mapped == MAP_FAILED)
-      {
-        rustfrida_set_error (module, libc, "map agent bss failed");
-        goto fail;
-      }
-      rustfrida_set_vma_name (load_bias + file_backed_end, seg_end - file_backed_end, agent_vma_name);
     }
 
     if (phdr->p_memsz > phdr->p_filesz)
@@ -1204,6 +1211,8 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
         frida_memset ((void *) bss_start, 0, bss_end - bss_start);
     }
   }
+
+  frida_send_log (diagfd, "link: load segments mapped", libc);
 
   module->base = load_bias;
   module->load_start = (ElfW(Addr)) reservation;
@@ -1225,9 +1234,11 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
     rustfrida_set_error (module, libc, "agent dynamic section incomplete");
     goto fail;
   }
+  frida_send_log (diagfd, "link: dynamic parsed", libc);
 
   if (!rustfrida_build_symbol_resolver (module, libc))
     goto fail;
+  frida_send_log (diagfd, "link: resolver built", libc);
 
   for (dyn = module->dynamic; dyn != NULL && dyn->d_tag != DT_NULL; dyn++)
   {
@@ -1259,13 +1270,17 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
 
   if (rela != NULL && !rustfrida_apply_relocations (module, rela, relasz, libc))
     goto fail;
+  frida_send_log (diagfd, "link: rela applied", libc);
   if (jmprel != NULL && !rustfrida_apply_relocations (module, jmprel, pltrelsz, libc))
     goto fail;
+  frida_send_log (diagfd, "link: plt rela applied", libc);
 
   if (!rustfrida_protect_relro (module, libc))
     goto fail;
+  frida_send_log (diagfd, "link: relro protected", libc);
 
   rustfrida_call_init_functions (module);
+  frida_send_log (diagfd, "link: init done", libc);
   return true;
 
 fail:
@@ -1389,8 +1404,9 @@ frida_main (void * user_data)
       goto beach;
     }
 
-    if (!rustfrida_link_agent (agent_codefd, libc, &agent_module))
+    if (!rustfrida_link_agent (agent_codefd, libc, &agent_module, ctrlfd))
       goto dlopen_failed;
+    frida_send_log (ctrlfd, "worker: agent linked", libc);
 
     frida_raw_close (agent_codefd);
     agent_codefd = -1;
@@ -1399,12 +1415,14 @@ frida_main (void * user_data)
     if (ctx->agent_entrypoint_impl == NULL)
       goto dlsym_failed;
     ctx->agent_current_thread_eval_impl = rustfrida_find_export (&agent_module, ctx->agent_current_thread_eval);
+    frida_send_log (ctrlfd, "worker: exports resolved", libc);
 
     ctx->agent_handle = (void *) agent_module.base;
   }
 
   /* Receive the REPL socketpair fd for the agent */
   agent_ctrlfd = frida_receive_fd (ctrlfd, libc);
+  frida_send_log (ctrlfd, "worker: repl fd received", libc);
   if (agent_ctrlfd != -1)
     frida_enable_close_on_exec (agent_ctrlfd, libc);
 
@@ -1592,6 +1610,12 @@ frida_send_error (int sockfd, FridaMessageType type, const char * message, const
   FRIDA_SEND_BYTES (message, length);
 
   return true;
+}
+
+static bool
+frida_send_log (int sockfd, const char * message, const FridaLibcApi * libc)
+{
+  return frida_send_error (sockfd, FRIDA_MESSAGE_LOG, message, libc);
 }
 
 static bool

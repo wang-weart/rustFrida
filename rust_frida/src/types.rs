@@ -58,6 +58,7 @@ pub(crate) mod message_type {
     pub const BYE: u8 = 3;
     pub const ERROR_DLOPEN: u8 = 4;
     pub const ERROR_DLSYM: u8 = 5;
+    pub const LOG: u8 = 6;
 }
 
 /// FridaBootstrapContext — bootstrapper 的输入/输出参数
