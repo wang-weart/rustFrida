@@ -46,6 +46,7 @@ extern "C" {
         tramp_base: u64,
         tramp_cap: usize,
         tramp_used: *mut usize,
+        suspend_entrypoint: u64,
         translate_existing: Option<unsafe extern "C" fn(u64, *mut libc::c_void) -> u64>,
         translate_user_data: *mut libc::c_void,
         stats: *mut RecompileStatsC,
@@ -163,6 +164,15 @@ unsafe impl Send for RecompiledPage {}
 /// 全局重编译页管理器
 static RECOMP_PAGES: Mutex<Option<HashMap<usize, RecompiledPage>>> = Mutex::new(None);
 static RECOMP_IN_PROGRESS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static SUSPEND_POLLS_ENTRYPOINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_suspend_poll_entrypoint(entrypoint: usize) {
+    SUSPEND_POLLS_ENTRYPOINT.store(entrypoint as u64, std::sync::atomic::Ordering::Release);
+}
+
+fn suspend_poll_entrypoint() -> u64 {
+    SUSPEND_POLLS_ENTRYPOINT.load(std::sync::atomic::Ordering::Acquire)
+}
 
 fn sign_extend(value: i64, bits: u32) -> i64 {
     let shift = 64 - bits;
@@ -665,6 +675,10 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
     if implicit_suspend_entry == 0 {
         return Ok(());
     }
+    set_suspend_poll_entrypoint(implicit_suspend_entry);
+    if orig_addr == 0 {
+        return Ok(());
+    }
 
     ensure_init();
 
@@ -691,6 +705,9 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
         let recomp_code_addr = unsafe { page.recomp_ptr.add(offset) as usize };
         let current = unsafe { ptr::read_unaligned(recomp_code_addr as *const u32) };
         if current != 0xf940_02b5 {
+            // recompile_page() may already have translated this implicit
+            // suspend poll into a guard trampoline. Do not overwrite a
+            // non-original instruction here.
             continue;
         }
 
@@ -1293,6 +1310,7 @@ fn compile_reserved_page(
             tramp_base,
             tramp_cap,
             &mut tramp_used,
+            suspend_poll_entrypoint(),
             Some(translate_existing_for_recompile),
             std::ptr::null_mut(),
             &mut stats,
@@ -1375,6 +1393,7 @@ fn do_recompile_temp(orig_base: usize) -> Result<TempRecomp> {
                 tramp_base,
                 tramp_cap,
                 &mut tramp_used,
+                suspend_poll_entrypoint(),
                 Some(translate_existing_for_recompile),
                 std::ptr::null_mut(),
                 &mut stats,

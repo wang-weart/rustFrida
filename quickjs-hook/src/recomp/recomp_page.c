@@ -34,9 +34,37 @@ static int is_branch_type(Arm64InsnType type) {
     }
 }
 
-/* 判断指令是否不可能 fall-through（无条件跳转/返回） */
+/* 判断指令是否不可能 fall-through（无条件跳转/返回）。
+ * BLR 是 call，callee RET 后必须继续执行下一条，不能当作 terminator。 */
 static int is_unconditional_transfer(Arm64InsnType type) {
-    return type == ARM64_INSN_B || type == ARM64_INSN_BR || type == ARM64_INSN_BLR || type == ARM64_INSN_RET;
+    return type == ARM64_INSN_B || type == ARM64_INSN_BR || type == ARM64_INSN_RET;
+}
+
+static int is_art_implicit_suspend_poll(uint32_t insn) {
+    return insn == 0xf94002b5u; /* ldr x21, [x21] */
+}
+
+static int emit_suspend_poll_skip_null_trampoline(
+    Arm64Writer* w,
+    uint32_t insn,
+    uint64_t orig_fallthrough,
+    uint64_t suspend_entrypoint,
+    uint64_t translated_fallthrough
+) {
+    uint64_t do_poll = arm64_writer_new_label_id(w);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X21, do_poll);
+    if (suspend_entrypoint != 0) {
+        arm64_writer_put_ldr_reg_address(w, ARM64_REG_X30, orig_fallthrough);
+        if (arm64_writer_put_b_imm(w, suspend_entrypoint) != 0) {
+            arm64_writer_put_branch_address_reg(w, suspend_entrypoint, ARM64_REG_X16);
+        }
+    } else {
+        if (arm64_writer_put_b_imm(w, translated_fallthrough) != 0)
+            return -1;
+    }
+    arm64_writer_put_label(w, do_poll);
+    arm64_writer_put_insn(w, insn);
+    return arm64_writer_put_b_imm(w, translated_fallthrough);
 }
 
 /* ============================================================================
@@ -496,6 +524,7 @@ int recompile_page(
     uint64_t tramp_base,
     size_t tramp_cap,
     size_t* tramp_used,
+    uint64_t suspend_entrypoint,
     RecompTranslateExistingFn translate_existing,
     void* translate_user_data,
     RecompileStats* stats
@@ -597,6 +626,52 @@ int recompile_page(
                          (unsigned long long)info.target);
                 goto done;
             }
+        }
+
+        /* ART arm64 quick implicit suspend checks are encoded as
+         *   ldr x21, [x21]
+         * on the original OAT/boot page. Executing the same instruction on an
+         * anonymous recomp page with x21 == 0 raises SIGSEGV outside ART's
+         * generated-code fault-manager range. When a quick suspend entrypoint
+         * is known, dispatch to ART with LR set to the original next OAT PC;
+         * otherwise skip the null fault as a temporary fallback. This must run
+         * before the page-end fall-through fixup, so a poll at the last page
+         * instruction is never copied into a generic fall-through trampoline. */
+        if (is_art_implicit_suspend_poll(insn)) {
+            if (!arm64_writer_can_write(&tw, suspend_entrypoint != 0 ? 56 : 24)) {
+                local_stats.error = -1;
+                snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                         "跳板区空间不足 (suspend-poll guard offset=0x%x)", i * 4);
+                goto done;
+            }
+
+            uint64_t tramp_pc = arm64_writer_pc(&tw);
+            uint64_t translated_fallthrough = is_last ? (orig_base + RECOMP_PAGE_SIZE) : (recomp_pc + 4);
+            uint64_t orig_fallthrough = orig_pc + 4;
+            if (emit_suspend_poll_skip_null_trampoline(&tw, insn, orig_fallthrough,
+                                                       suspend_entrypoint, translated_fallthrough) != 0) {
+                local_stats.error = -1;
+                snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                         "suspend-poll guard 跳板超出 B 范围 (offset=0x%x)", i * 4);
+                goto done;
+            }
+
+            uint32_t branch_insn;
+            if (encode_b(recomp_pc, tramp_pc, &branch_insn) != 0) {
+                local_stats.error = -1;
+                snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                         "无法编码到 suspend-poll guard 跳板 (offset=0x%x)", i * 4);
+                goto done;
+            }
+
+            recomp_insns[i] = branch_insn;
+            local_stats.num_trampolines++;
+            hook_log("[recomp-SUSPEND] page=%llx +0x%03x: %08x -> guard tramp=%llx ret=%llx entry=%llx",
+                     (unsigned long long)orig_base, i * 4, insn,
+                     (unsigned long long)tramp_pc,
+                     (unsigned long long)translated_fallthrough,
+                     (unsigned long long)suspend_entrypoint);
+            continue;
         }
 
         /* ================================================================

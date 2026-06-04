@@ -43,10 +43,11 @@ static STEALTH_MODE: AtomicU8 = AtomicU8::new(StealthMode::Normal as u8);
 
 /// Recomp 翻译回调：供 C 层 oat_patch 使用
 unsafe extern "C" fn recomp_translate_for_c(orig_addr: usize) -> usize {
+    let suspend_entry = resolve_recomp_suspend_poll_entrypoint();
     match crate::recomp::ensure_and_translate(orig_addr) {
         Ok(addr) => {
             register_recomp_signal_range(orig_addr, addr);
-            if let Some(entry) = resolve_recomp_suspend_poll_entrypoint() {
+            if let Some(entry) = suspend_entry {
                 let _ = crate::recomp::patch_suspend_polls(orig_addr, entry);
             }
             addr
@@ -271,10 +272,11 @@ unsafe fn prepare_hook_target_inner(
         StealthMode::Recomp => {
             // Recomp 模式: recomp 代码页上写 1 条 B→slot，slot 里由 hook engine 写 thunk。
             // sflag=0 让 hook engine 把 slot 当普通地址处理，无需知道 stealth2。
+            let suspend_entry = resolve_recomp_suspend_poll_entrypoint();
             let recomp_addr = crate::recomp::ensure_and_translate(real_addr as usize)
                 .map_err(|e| format!("recomp translate {:#x}: {}", real_addr, e))?;
             register_recomp_signal_range(real_addr as usize, recomp_addr);
-            if let Some(entry) = resolve_recomp_suspend_poll_entrypoint() {
+            if let Some(entry) = suspend_entry {
                 crate::recomp::patch_suspend_polls(real_addr as usize, entry)
                     .map_err(|e| format!("recomp suspend patch {:#x}: {}", real_addr, e))?;
             }
@@ -1685,9 +1687,12 @@ fn resolve_suspend_poll_entrypoint() -> Option<usize> {
 fn resolve_recomp_suspend_poll_entrypoint() -> Option<usize> {
     let test_suspend = unsafe { super::java_fast_api::art_quick_test_suspend_entrypoint() as usize };
     if test_suspend != 0 {
+        let _ = crate::recomp::patch_suspend_polls(0, test_suspend);
         return Some(test_suspend);
     }
-    resolve_suspend_poll_entrypoint()
+    let entry = resolve_suspend_poll_entrypoint()?;
+    let _ = crate::recomp::patch_suspend_polls(0, entry);
+    Some(entry)
 }
 
 fn arm64_self_ldr_reg(inst: u32) -> Option<usize> {
