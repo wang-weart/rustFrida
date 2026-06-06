@@ -1409,6 +1409,7 @@ fn stack_replacement_source(method: u64) -> Option<u64> {
     let registry = guard.as_ref()?;
     for data in registry.values() {
         match &data.hook_type {
+            super::callback::HookType::NativeEntry => {}
             super::callback::HookType::Replaced { replacement_addr, .. } if *replacement_addr as u64 == method => {
                 return Some(data.art_method)
             }
@@ -1579,6 +1580,10 @@ unsafe fn synchronize_replacement_methods() {
         None => return,
     };
     for (_, data) in registry.iter() {
+        if matches!(data.hook_type, HookType::NativeEntry) {
+            continue;
+        }
+
         let art_method = data.art_method as usize;
 
         // --- Fix 1: declaring_class_ 同步 ---
@@ -1589,6 +1594,7 @@ unsafe fn synchronize_replacement_methods() {
         // the hooked method's class.
         {
             let (replacement_addr, declaring_class_source) = match &data.hook_type {
+                HookType::NativeEntry => (0, 0),
                 HookType::Replaced { replacement_addr, .. } => (*replacement_addr, data.art_method),
                 HookType::Quick {
                     replacement_addr,
@@ -1610,13 +1616,16 @@ unsafe fn synchronize_replacement_methods() {
             }
         }
 
-        // --- flags 修复: 确保 kAccCompileDontBother 在 + kAccFastInterpreterToInterpreterInvoke 不在 ---
-        let cdontbother = k_acc_compile_dont_bother();
-        let flags = std::ptr::read_volatile((art_method + spec.access_flags_offset) as *const u32);
-        let need_fix = (cdontbother != 0 && (flags & cdontbother) == 0) || (flags & K_ACC_FAST_INTERP_TO_INTERP) != 0;
-        if need_fix {
-            let fixed = (flags | cdontbother) & !K_ACC_FAST_INTERP_TO_INTERP;
-            std::ptr::write_volatile((art_method + spec.access_flags_offset) as *mut u32, fixed);
+        if data.hook_type.original_flags_mutated() {
+            // --- flags 修复: 确保 kAccCompileDontBother 在 + kAccFastInterpreterToInterpreterInvoke 不在 ---
+            let cdontbother = k_acc_compile_dont_bother();
+            let flags = std::ptr::read_volatile((art_method + spec.access_flags_offset) as *const u32);
+            let need_fix =
+                (cdontbother != 0 && (flags & cdontbother) == 0) || (flags & K_ACC_FAST_INTERP_TO_INTERP) != 0;
+            if need_fix {
+                let fixed = (flags | cdontbother) & !K_ACC_FAST_INTERP_TO_INTERP;
+                std::ptr::write_volatile((art_method + spec.access_flags_offset) as *mut u32, fixed);
+            }
         }
 
         // Target ArtMethod.entry_point_/data_ are intentionally left untouched.

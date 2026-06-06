@@ -1532,6 +1532,9 @@ pub fn register_java_api(ctx: &JSContext) {
 /// cleanup 时用旧快照覆盖 ART 自己后续做出的更新。路由切断通过 code hook /
 /// ART shared entry hook 完成。
 pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
+    if !data.hook_type.original_flags_mutated() {
+        return;
+    }
     if let Some(spec) = ART_METHOD_SPEC.get() {
         std::ptr::write_volatile(
             (data.art_method as usize + spec.access_flags_offset) as *mut u32,
@@ -1554,6 +1557,7 @@ pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
     }
 
     match &data.hook_type {
+        callback::HookType::NativeEntry => {}
         callback::HookType::Replaced {
             per_method_hook_target, ..
         }
@@ -1581,12 +1585,16 @@ pub(super) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
 
 /// 移除 native trampoline (hook_remove_redirect)。
 pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
+    if matches!(data.hook_type, callback::HookType::NativeEntry) {
+        return;
+    }
     hook_ffi::hook_remove_redirect(data.art_method);
 }
 
 /// 释放 replacement/clone ArtMethod 堆内存 + JNI global ref + JS callback。
 pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
     let replacement_addr = match &data.hook_type {
+        callback::HookType::NativeEntry => 0,
         callback::HookType::Replaced { replacement_addr, .. } | callback::HookType::Quick { replacement_addr, .. } => {
             *replacement_addr
         }

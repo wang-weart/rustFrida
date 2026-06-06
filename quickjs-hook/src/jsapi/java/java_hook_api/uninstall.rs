@@ -96,6 +96,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
         with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
             if let Some(data) = registry.get_mut(&art_method_addr) {
                 match &mut data.hook_type {
+                    HookType::NativeEntry => {}
                     HookType::Replaced {
                         per_method_hook_target, ..
                     }

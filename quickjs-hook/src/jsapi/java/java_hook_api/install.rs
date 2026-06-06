@@ -246,12 +246,120 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let is_native_method = (original_access_flags & K_ACC_NATIVE) != 0;
     let is_shared_jni_entry = original_entry_point == bridge.quick_generic_jni_trampoline
         || (bridge.resolved_jni_entrypoint != 0 && original_entry_point == bridge.resolved_jni_entrypoint);
-    let shared_native_art_entry = is_native_method && is_shared_jni_entry;
+    let has_registered_native_entry = is_native_method
+        && original_data != 0
+        && is_registered_native_entry_candidate(original_data, bridge);
+    let shared_native_art_entry = is_native_method && !has_independent_code && !has_registered_native_entry;
+    let native_entry_is_quick_entry = has_registered_native_entry && original_entry_point == original_data;
+    let route_has_independent_code =
+        (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
+    let shared_jni_native_router = is_native_method && shared_native_art_entry && !has_registered_native_entry;
+    let mutate_original_method_flags = !shared_jni_native_router;
 
     output_verbose(&format!(
-        "[java hook] Step 4: has_independent_code={} native={} shared_jni={} (ep={:#x})",
-        has_independent_code, is_native_method, is_shared_jni_entry, original_entry_point
+        "[java hook] Step 4: has_independent_code={} route_independent={} native={} shared_jni={} shared_native_art_entry={} registered_native={} (data={:#x}, ep={:#x})",
+        has_independent_code,
+        route_has_independent_code,
+        is_native_method,
+        is_shared_jni_entry,
+        shared_native_art_entry,
+        has_registered_native_entry,
+        original_data,
+        original_entry_point
     ));
+
+    if has_registered_native_entry {
+        let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
+        with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+            registry.insert(
+                art_method,
+                JavaHookData {
+                    art_method,
+                    original_access_flags,
+                    original_entry_point,
+                    original_data,
+                    hook_type: HookType::NativeEntry,
+                    clone_addr,
+                    class_global_ref,
+                    return_type,
+                    return_type_sig: return_type_sig.clone(),
+                    ctx: ctx as usize,
+                    callback_bytes,
+                    method_key: method_key(&class_name, &method_name, &actual_sig),
+                    is_static,
+                    param_count,
+                    param_types: param_types.clone(),
+                    class_name: class_name.clone(),
+                    quick_trampoline: 0,
+                    use_blr: false,
+                    native_entry_hook_target: 0,
+                    native_entry_trampoline: 0,
+                    native_entry_critical: is_critical_native,
+                },
+            );
+        });
+
+        let native_callback: hook_ffi::HookCallback = if is_critical_native {
+            Some(java_critical_native_hook_callback)
+        } else {
+            Some(java_hook_callback)
+        };
+        let install_native_entry = (|| -> Result<(u64, u64, u64), String> {
+            let (hook_addr, sflag) =
+                super::super::art_controller::prepare_hook_target(original_data, std::ptr::null_mut())
+                    .map_err(|e| format!("registered native entry prepare: {}", e))?;
+            let trampoline = hook_ffi::hook_replace(
+                hook_addr as *mut std::ffi::c_void,
+                native_callback,
+                art_method as *mut std::ffi::c_void,
+                sflag,
+            );
+            if trampoline.is_null() {
+                return Err(format!(
+                    "registered native entry hook failed: target={:#x}, hook={:#x}",
+                    original_data, hook_addr
+                ));
+            }
+            super::super::art_controller::try_fixup_trampoline_pub(trampoline, original_data);
+            std::ptr::write_volatile((clone_addr as usize + data_off) as *mut u64, trampoline as u64);
+            std::ptr::write_volatile((clone_addr as usize + ep_offset) as *mut u64, jni_trampoline);
+            Ok((original_data, hook_addr, trampoline as u64))
+        })();
+
+        match install_native_entry {
+            Ok((target, hook_target, trampoline)) => {
+                with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+                    if let Some(hook_data) = registry.get_mut(&art_method) {
+                        hook_data.native_entry_hook_target = hook_target;
+                        hook_data.native_entry_trampoline = trampoline;
+                        hook_data.native_entry_critical = is_critical_native;
+                    }
+                });
+                install_guard.set_native_entry_hook_target(hook_target);
+                output_verbose(&format!(
+                    "[java hook] registered native entry hooked without original ArtMethod mutation: target={:#x}, hook={:#x}, trampoline={:#x}, clone={:#x}, critical={}",
+                    target, hook_target, trampoline, clone_addr, is_critical_native
+                ));
+                output_verbose(&format!(
+                    "[java hook] 完成: {}.{}{} (ArtMethod={:#x}, strategy=native-entry-only)",
+                    class_name, method_name, actual_sig, art_method
+                ));
+                install_guard.commit();
+                return JSValue::bool(true).raw();
+            }
+            Err(msg) => {
+                if let Some(removed) =
+                    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
+                {
+                    free_callback_bytes(ctx, removed.callback_bytes);
+                } else {
+                    free_callback_bytes(ctx, callback_bytes);
+                }
+                libc::free(clone_addr as *mut std::ffi::c_void);
+                return throw_internal_error(ctx, &msg);
+            }
+        }
+    }
 
     // Clone+Replace 模式 (对标 Frida):
     // 原始 ArtMethod 仅修改 flags (deopt)，不设 kAccNative。
@@ -302,6 +410,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 hook_type: HookType::Replaced {
                     replacement_addr,
                     per_method_hook_target: None,
+                    original_flags_mutated: mutate_original_method_flags,
                 },
                 clone_addr,
                 class_global_ref,
@@ -327,7 +436,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     // 此时 replacement 尚未加入 art_router 表；若其他线程打到 quickCode，会继续走原始方法，
     // 避免热点方法在半安装窗口进入 JS callback。
     let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body) = match install_per_method_router_hook(
-        has_independent_code,
+        route_has_independent_code,
         original_entry_point,
         &bridge,
         ep_offset,
@@ -353,6 +462,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
             hook_data.hook_type = HookType::Replaced {
                 replacement_addr,
                 per_method_hook_target,
+                original_flags_mutated: mutate_original_method_flags,
             };
             hook_data.quick_trampoline = quick_trampoline;
             hook_data.use_blr = use_blr;
@@ -363,69 +473,22 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     set_replacement_method(art_method, replacement_addr as u64);
     install_guard.set_replacement_registered();
 
-    // B4: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
-    // 不设 kAccNative! 仅 deopt + 清除快速路径标志。放到最后，避免半安装状态暴露给其他线程。
-    update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
-    install_guard.set_original_method_mutated();
+    if mutate_original_method_flags {
+        // B4: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
+        // 不设 kAccNative! 仅 deopt + 清除快速路径标志。放到最后，避免半安装状态暴露给其他线程。
+        update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
+        install_guard.set_original_method_mutated();
+    } else {
+        output_verbose(&format!(
+            "[java hook] shared JNI native router: original ArtMethod flags unchanged ({:#x})",
+            original_access_flags
+        ));
+    }
 
     let jni_trampoline_router_ready = super::super::art_controller::jni_trampoline_router_installed();
-    if (original_access_flags & K_ACC_NATIVE) != 0
-        && !jni_trampoline_router_ready
-        && original_data != 0
-        && is_registered_native_entry_candidate(original_data, bridge)
-    {
-        let native_callback: hook_ffi::HookCallback = if is_critical_native {
-            Some(java_critical_native_hook_callback)
-        } else {
-            Some(java_hook_callback)
-        };
-        let install_native_entry = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
-            let Some(hook_data) = registry.get_mut(&art_method) else {
-                return Err("registered native hook data disappeared".to_string());
-            };
-            let (hook_addr, sflag) =
-                super::super::art_controller::prepare_hook_target(original_data, std::ptr::null_mut())
-                    .map_err(|e| format!("registered native entry prepare: {}", e))?;
-            let trampoline = hook_ffi::hook_replace(
-                hook_addr as *mut std::ffi::c_void,
-                native_callback,
-                art_method as *mut std::ffi::c_void,
-                sflag,
-            );
-            if trampoline.is_null() {
-                return Err(format!(
-                    "registered native entry hook failed: target={:#x}, hook={:#x}",
-                    original_data, hook_addr
-                ));
-            }
-            super::super::art_controller::try_fixup_trampoline_pub(trampoline, original_data);
-            hook_data.native_entry_hook_target = hook_addr;
-            hook_data.native_entry_trampoline = trampoline as u64;
-            hook_data.native_entry_critical = is_critical_native;
-            Ok((original_data, hook_addr, trampoline as u64))
-        })
-        .unwrap_or_else(|| Err("java hook registry not initialized".to_string()));
-
-        match install_native_entry {
-            Ok((target, hook_target, trampoline)) => {
-                install_guard.set_native_entry_hook_target(hook_target);
-                output_verbose(&format!(
-                    "[java hook] registered native entry hooked: target={:#x}, hook={:#x}, trampoline={:#x}, critical={}",
-                    target, hook_target, trampoline, is_critical_native
-                ));
-            }
-            Err(msg) => {
-                if let Some(removed) =
-                    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
-                {
-                    free_callback_bytes(ctx, removed.callback_bytes);
-                }
-                return throw_internal_error(ctx, &msg);
-            }
-        }
-    } else if (original_access_flags & K_ACC_NATIVE) != 0 {
+    if (original_access_flags & K_ACC_NATIVE) != 0 {
         output_verbose(&format!(
-            "[java hook] registered native entry skipped: data_={:#x}, jni_router={}",
+            "[java hook] registered native entry skipped: data_={:#x}, candidate=false, jni_router={}",
             original_data, jni_trampoline_router_ready
         ));
     }
@@ -435,8 +498,14 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         class_name
     ));
 
-    let strategy = if has_independent_code {
-        "compiled+router"
+    let strategy = if shared_jni_native_router {
+        "native-shared-jni-router"
+    } else if has_independent_code {
+        if route_has_independent_code {
+            "compiled+router"
+        } else {
+            "registered-native-entry"
+        }
     } else {
         "shared_stub"
     };

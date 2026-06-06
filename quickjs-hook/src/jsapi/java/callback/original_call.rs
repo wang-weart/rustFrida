@@ -796,6 +796,52 @@ pub(crate) unsafe fn build_jargs_from_registers(
     jargs
 }
 
+unsafe fn delete_owned_jvalue_refs(env: JniEnv, refs: &[u64]) {
+    if refs.is_empty() {
+        return;
+    }
+    if crate::is_raw_clone_js_thread() {
+        for &raw in refs {
+            raw_delete_local_ref(env, raw as *mut std::ffi::c_void);
+        }
+    } else {
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+        for &raw in refs {
+            delete_local_ref(env, raw as *mut std::ffi::c_void);
+        }
+    }
+}
+
+unsafe fn build_jargs_from_js_args(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    param_count: usize,
+    param_types: &[String],
+) -> Result<(Vec<u64>, Vec<u64>), ffi::JSValue> {
+    if argc as usize != param_count {
+        let msg = format!(
+            "orig(...args) expected {} argument(s), got {}\0",
+            param_count, argc
+        );
+        return Err(ffi::JS_ThrowTypeError(ctx, msg.as_ptr() as *const _));
+    }
+
+    let mut jargs = Vec::with_capacity(param_count);
+    let mut owned_refs = Vec::new();
+    for i in 0..param_count {
+        let val = JSValue(*argv.add(i));
+        let type_sig = param_types.get(i).map(|s| s.as_str());
+        let marshaled = marshal_js_to_jvalue_owned(ctx, env, val, type_sig);
+        if marshaled.owned_local_ref && marshaled.raw != 0 {
+            owned_refs.push(marshaled.raw);
+        }
+        jargs.push(marshaled.raw);
+    }
+    Ok((jargs, owned_refs))
+}
+
 unsafe fn js_value_from_jni_return(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
@@ -962,8 +1008,8 @@ pub(crate) unsafe fn prepare_fast_orig_router_frame(
 unsafe extern "C" fn js_call_original(
     ctx: *mut ffi::JSContext,
     this_val: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let atoms = hot_atoms();
     let art_method_addr = get_js_u64_property_atom(ctx, this_val, atoms.hook_art_method);
@@ -1048,6 +1094,12 @@ unsafe extern "C" fn js_call_original(
     }
 
     if native_entry_trampoline != 0 && native_entry_critical {
+        if argc > 0 {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"orig(...args) is not supported for critical native hooks\0".as_ptr() as *const _,
+            );
+        }
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             native_entry_trampoline as *mut std::ffi::c_void,
@@ -1073,7 +1125,37 @@ unsafe extern "C" fn js_call_original(
         e
     };
 
+    let (supplied_jargs, supplied_owned_refs) = if argc > 0 {
+        match build_jargs_from_js_args(ctx, env, argc, argv, param_count, &param_types) {
+            Ok(v) => (Some(v.0), v.1),
+            Err(e) => return e,
+        }
+    } else {
+        (None, Vec::new())
+    };
+
     if native_entry_trampoline != 0 {
+        if let Some(ref jargs) = supplied_jargs {
+            let jargs_ptr = if jargs.is_empty() {
+                std::ptr::null()
+            } else {
+                jargs.as_ptr() as *const std::ffi::c_void
+            };
+            let ret_raw = invoke_original_jni(
+                env,
+                art_method_addr,
+                class_global_ref,
+                hook_ctx.x[1],
+                return_type,
+                is_static,
+                jargs_ptr,
+                quick_trampoline,
+                use_blr,
+            );
+            delete_owned_jvalue_refs(env, &supplied_owned_refs);
+            return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
+        }
+
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             native_entry_trampoline as *mut std::ffi::c_void,
@@ -1087,12 +1169,9 @@ unsafe extern "C" fn js_call_original(
         return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
     }
 
-    // 始终从 hook_ctx 寄存器读参数 (transition ref)。
-    // transition ref 指向 GenericJNI 帧 vreg CompressedReference，GC 会实时更新该值。
-    // 比从 JS __jptr 缓存读更安全（__jptr 和 transition ref 是同一个栈地址，
-    // 但绕过 marshal 避免潜在的 JS 对象生命周期问题）。
-    // TODO: 支持用户修改参数时需要 hybrid 策略
-    let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
+    // 无参 orig() 仍从 hook_ctx 寄存器读原始 transition refs；显式
+    // orig(arg0, ...) 则使用 JS 传入值，支持 hook 中改参后调用原方法。
+    let jargs = supplied_jargs.unwrap_or_else(|| build_jargs_from_registers(hook_ctx, param_count, &param_types));
     let jargs_ptr = if param_count > 0 {
         jargs.as_ptr() as *const std::ffi::c_void
     } else {
@@ -1100,6 +1179,7 @@ unsafe extern "C" fn js_call_original(
     };
 
     if !is_static && hook_ctx.x[1] == 0 {
+        delete_owned_jvalue_refs(env, &supplied_owned_refs);
         return match return_type {
             b'V' => ffi::qjs_undefined(),
             b'Z' => JSValue::bool(false).raw(),
@@ -1117,6 +1197,7 @@ unsafe extern "C" fn js_call_original(
     {
         let thread_id = crate::current_thread_id_u64();
         if hook_ffi::fast_orig_set(thread_id, art_method_addr, quick_trampoline) == 0 {
+            delete_owned_jvalue_refs(env, &supplied_owned_refs);
             return match return_type {
                 b'V' => ffi::qjs_undefined(),
                 b'Z' => JSValue::bool(false).raw(),
@@ -1140,6 +1221,7 @@ unsafe extern "C" fn js_call_original(
         quick_trampoline,
         use_blr,
     );
+    delete_owned_jvalue_refs(env, &supplied_owned_refs);
 
     js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig)
 }

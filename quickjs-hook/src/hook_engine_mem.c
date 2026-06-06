@@ -878,9 +878,8 @@ static int pool_in_adrp_range(ExecPool* pool, void* target) {
     return dist > -range && dist < range;
 }
 
-/* 判断 pool 是否在 target 的指定范围内 */
-static int pool_in_range(ExecPool* pool, void* target, int64_t range) {
-    int64_t dist = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
+static int ptr_in_range(void* ptr, void* target, int64_t range) {
+    int64_t dist = (int64_t)((uint8_t*)ptr - (uint8_t*)target);
     return dist > -range && dist < range;
 }
 
@@ -952,17 +951,19 @@ void* hook_alloc_near(size_t size, void* target) {
 
     /* 1a: 现有 pool 中找 ±128MB 内有空间的 */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
-        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
-        if (dist > -b_range && dist < b_range) {
-            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        if (ptr_in_range(ptr, target, b_range)) {
             g_engine.exec_mem_used += size;
             return ptr;
         }
     }
     for (int i = 0; i < g_engine.pool_count; i++) {
-        if (pool_in_range(&g_engine.pools[i], target, b_range)) {
-            void* ptr = alloc_from_pool(&g_engine.pools[i], size);
-            if (ptr) return ptr;
+        ExecPool* pool = &g_engine.pools[i];
+        if (pool->used + size <= pool->size) {
+            void* ptr = (uint8_t*)pool->base + pool->used;
+            if (ptr_in_range(ptr, target, b_range)) {
+                return alloc_from_pool(pool, size);
+            }
         }
     }
 
@@ -979,17 +980,19 @@ void* hook_alloc_near(size_t size, void* target) {
 
     /* 2a: 现有 pool 中找 ±4GB 内有空间的 */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
-        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
-        if (dist > -adrp_range && dist < adrp_range) {
-            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        if (ptr_in_range(ptr, target, adrp_range)) {
             g_engine.exec_mem_used += size;
             return ptr;
         }
     }
     for (int i = 0; i < g_engine.pool_count; i++) {
-        if (pool_in_range(&g_engine.pools[i], target, adrp_range)) {
-            void* ptr = alloc_from_pool(&g_engine.pools[i], size);
-            if (ptr) return ptr;
+        ExecPool* pool = &g_engine.pools[i];
+        if (pool->used + size <= pool->size) {
+            void* ptr = (uint8_t*)pool->base + pool->used;
+            if (ptr_in_range(ptr, target, adrp_range)) {
+                return alloc_from_pool(pool, size);
+            }
         }
     }
 
@@ -1025,9 +1028,8 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
 
     /* Phase 1: 初始 pool */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
-        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
-        if (dist > -max_range && dist < max_range) {
-            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        if (ptr_in_range(ptr, target, max_range)) {
             g_engine.exec_mem_used += size;
             return ptr;
         }
@@ -1036,8 +1038,11 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
     /* Phase 1b: 额外 pool */
     for (int i = 0; i < g_engine.pool_count; i++) {
         ExecPool* pool = &g_engine.pools[i];
-        if (pool_in_range(pool, target, max_range) && pool->used + size <= pool->size) {
-            return alloc_from_pool(pool, size);
+        if (pool->used + size <= pool->size) {
+            void* ptr = (uint8_t*)pool->base + pool->used;
+            if (ptr_in_range(ptr, target, max_range)) {
+                return alloc_from_pool(pool, size);
+            }
         }
     }
 

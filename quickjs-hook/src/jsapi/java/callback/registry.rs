@@ -6,6 +6,11 @@
 /// 所有回调统一 JNI 调用约定: x0=JNIEnv*, x1=this/jclass, x2+=args
 #[derive(Debug, Clone)]
 pub(super) enum HookType {
+    /// Registered native fnPtr hook only.
+    ///
+    /// The original ArtMethod is not modified. The hook is installed by
+    /// patching the native function body pointed to by ArtMethod::data_.
+    NativeEntry,
     /// Unified replacement hook (art_router swaps ArtMethod*)
     /// - replacement_addr: heap-allocated replacement ArtMethod (native, jniCode=thunk)
     /// - per_method_hook_target: Some(quickCode) for compiled methods (Layer 3 router hook),
@@ -14,6 +19,7 @@ pub(super) enum HookType {
     Replaced {
         replacement_addr: usize,
         per_method_hook_target: Option<u64>,
+        original_flags_mutated: bool,
     },
     /// Experimental quick callback hook.
     /// Router calls Rust directly and only uses replacement_addr as a native
@@ -31,6 +37,19 @@ pub(super) enum HookType {
         sentinel_addr: usize,
         per_method_hook_target: Option<u64>,
     },
+}
+
+impl HookType {
+    pub(super) fn original_flags_mutated(&self) -> bool {
+        match self {
+            HookType::NativeEntry | HookType::Quick { .. } => false,
+            HookType::Replaced {
+                original_flags_mutated,
+                ..
+            } => *original_flags_mutated,
+            HookType::Managed { .. } => true,
+        }
+    }
 }
 
 #[derive(Clone)]
